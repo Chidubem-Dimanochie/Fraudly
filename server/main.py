@@ -4,21 +4,18 @@ from pydantic import BaseModel
 from connect import db
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-import os
 from typing import Optional
 
 app = FastAPI()
 
-# Initialize Cognito client (boto3 will use environment / ~/.aws credentials)
 cognito_client = boto3.client('cognito-idp', region_name='us-east-1')
 USER_POOL_ID = 'us-east-1_HgEmPHJj8'
 
-# CORS setup
 origins = [
     "http://localhost:3000",
     "http://10.88.7.176:3000",
     "https://main.d3sba06ap3p2l2.amplifyapp.com",
-
+    'https://fraudly-git-main-chidubem-dimanochies-projects.vercel.app',
 ]
 
 app.add_middleware(
@@ -39,19 +36,10 @@ class User(BaseModel):
     alertThreshold: Optional[float] = None
     isBanned: bool = False
 
-class AuditLog(BaseModel):
-    id: str
-    timestamp: str
-    actor: str
-    action: str
-    details: str
-
 users_collection = db.get_collection("users")
 logs_collection = db.get_collection("logs")
 
-# Helper function to check if AWS credentials are configured
 def check_aws_credentials():
-    """Return True if boto3 can find credentials."""
     try:
         session = boto3.Session()
         creds = session.get_credentials()
@@ -59,37 +47,23 @@ def check_aws_credentials():
     except Exception:
         return False
 
-# Helper: check if a Cognito user exists for a given username/email
-def cognito_user_exists(username_or_email: str) -> bool:
-    """
-    Returns True if a Cognito user exists with Username = username_or_email.
-    Note: If your Cognito usernames are NOT the email value, you may need to use
-    a different lookup (e.g. list users by filter on email attribute).
-    """
+def get_cognito_username_by_email(email: str) -> Optional[str]:
+    """Find Cognito username for a given email."""
     try:
-        # admin_get_user expects the Cognito Username. If you used email as username,
-        # this will work. Otherwise consider AdminListUsers with a filter on email.
-        cognito_client.admin_get_user(
+        resp = cognito_client.list_users(
             UserPoolId=USER_POOL_ID,
-            Username=username_or_email
+            Filter=f'email = "{email}"',
+            Limit=1
         )
-        return True
-    except NoCredentialsError:
-        # No credentials available locally — caller will decide policy
-        raise
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("UserNotFoundException", "ResourceNotFoundException"):
-            return False
-        # Re-raise for unexpected errors
-        raise
+        users = resp.get("Users", [])
+        if users:
+            return users[0]["Username"]
+        return None
+    except (NoCredentialsError, ClientError):
+        return None
 
-# Alternative: search Cognito users by email attribute (safer if Username != email)
 def cognito_find_user_by_email(email: str) -> bool:
-    """
-    Uses ListUsers with a filter on email attribute to detect existence.
-    Returns True if at least one user matches.
-    """
+    """Check if user exists in Cognito by email."""
     try:
         resp = cognito_client.list_users(
             UserPoolId=USER_POOL_ID,
@@ -97,9 +71,7 @@ def cognito_find_user_by_email(email: str) -> bool:
             Limit=1
         )
         return len(resp.get("Users", [])) > 0
-    except NoCredentialsError:
-        raise
-    except ClientError:
+    except (NoCredentialsError, ClientError):
         raise
 
 # GET all users
@@ -120,103 +92,118 @@ async def create_user(user: User):
     if existing_username:
         raise HTTPException(status_code=400, detail="Username already taken.")
 
-    # 2) If AWS creds present, check Cognito for a user with same email
+    # 2) Check Cognito for email conflict
     try:
         if check_aws_credentials():
-            # Use filter-by-email because Cognito username might be different than email
             if cognito_find_user_by_email(user.email):
-                # If a user exists in Cognito for this email, block local account creation.
                 raise HTTPException(
                     status_code=400,
-                    detail="This email is already registered with Cognito. Please sign in using Cognito (Hosted UI or Cognito login)."
+                    detail="This email is already registered with Cognito. Please sign in using Cognito."
                 )
     except NoCredentialsError:
-        # Credentials missing: we will allow creation but warn in logs
-        print("WARNING: AWS credentials not configured. Skipping Cognito existence check.")
+        print("WARNING: AWS credentials not configured. Skipping Cognito check.")
     except ClientError as e:
-        # Unexpected error when contacting Cognito: log and return 500
         print("Cognito lookup failed:", str(e))
-        raise HTTPException(status_code=500, detail="Error checking Cognito for existing user.")
+        raise HTTPException(status_code=500, detail="Error checking Cognito.")
 
     # 3) Insert into MongoDB
     users_collection.insert_one(user.dict())
     return user
 
-# PUT /api/users/{email} to update a user
-@app.put("/api/users/{email}")
-async def update_user(email: str, updated_data: dict):
-    # optional: prevent changing email to one that conflicts
-    if "email" in updated_data:
-        # If trying to change to an email that exists locally under a different user
-        conflict = users_collection.find_one({"email": updated_data["email"], "email": {"$ne": email}})
-        if conflict:
-            raise HTTPException(status_code=400, detail="Desired email is already in use by another account.")
+# GET user by email
+@app.get("/api/users/email/{email}")
+async def get_user_by_email(email: str):
+    user = users_collection.find_one({"email": email}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
-    # Update MongoDB first
+# GET user by username
+@app.get("/api/users/username/{username}")
+async def get_user_by_username(username: str):
+    user = users_collection.find_one({"username": username}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# PUT /api/users/email/{email} to update a user by email
+@app.put("/api/users/email/{email}")
+async def update_user_by_email(email: str, updated_data: dict):
+    # Check for email conflicts if changing email
+    if "email" in updated_data and updated_data["email"] != email:
+        conflict = users_collection.find_one({"email": updated_data["email"]})
+        if conflict:
+            raise HTTPException(status_code=400, detail="Email already in use.")
+
+    # Check for username conflicts if changing username
+    if "username" in updated_data:
+        conflict = users_collection.find_one({
+            "username": updated_data["username"],
+            "email": {"$ne": email}
+        })
+        if conflict:
+            raise HTTPException(status_code=400, detail="Username already taken.")
+
     result = users_collection.update_one({"email": email}, {"$set": updated_data})
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found in database")
+        raise HTTPException(status_code=404, detail="User not found")
 
-    # If role changed, attempt to sync with Cognito (if creds available)
+    # Handle Cognito role sync if credentials available
     if "role" in updated_data:
         try:
             if check_aws_credentials():
-                # Try update via Cognito admin APIs
-                # remove previous groups and add to new group (reuse your helper logic)
-                # For brevity, call your existing helper functions if defined
-                # Example: await update_user_cognito_group(email, updated_data['role'])
-                # But since this is sync code in a sync function, call cognito_client directly:
-                # First list current groups for user
-                try:
-                    groups_resp = cognito_client.admin_list_groups_for_user(Username=email, UserPoolId=USER_POOL_ID)
-                    current_groups = [g["GroupName"] for g in groups_resp.get("Groups", [])]
-                    for gname in current_groups:
-                        cognito_client.admin_remove_user_from_group(UserPoolId=USER_POOL_ID, Username=email, GroupName=gname)
-                except ClientError as e:
-                    code = e.response.get("Error", {}).get("Code", "")
-                    if code == "UserNotFoundException":
-                        # user doesn't exist in Cognito — skip gracefully
-                        print(f"User {email} not in Cognito, skipping group sync.")
-                    else:
-                        raise
+                cognito_username = get_cognito_username_by_email(email)
+                if cognito_username:
+                    # Remove from all groups
+                    try:
+                        groups_resp = cognito_client.admin_list_groups_for_user(
+                            Username=cognito_username,
+                            UserPoolId=USER_POOL_ID
+                        )
+                        for group in groups_resp.get("Groups", []):
+                            cognito_client.admin_remove_user_from_group(
+                                UserPoolId=USER_POOL_ID,
+                                Username=cognito_username,
+                                GroupName=group["GroupName"]
+                            )
+                    except ClientError:
+                        pass
 
-                # Add to new group
-                try:
-                    cognito_client.admin_add_user_to_group(UserPoolId=USER_POOL_ID, Username=email, GroupName=updated_data["role"])
-                except ClientError as e:
-                    code = e.response.get("Error", {}).get("Code", "")
-                    if code == "UserNotFoundException":
-                        print(f"User {email} not found in Cognito when trying to add to group {updated_data['role']}")
-                    else:
-                        raise
-            else:
-                print("WARNING: AWS credentials not configured. Skipping Cognito role sync.")
-        except NoCredentialsError:
-            print("WARNING: No AWS credentials available; skipping Cognito sync.")
-        except ClientError as e:
-            print("Cognito role sync error:", str(e))
-            # don't fail the request; we updated MongoDB already
+                    # Add to new group
+                    try:
+                        cognito_client.admin_add_user_to_group(
+                            UserPoolId=USER_POOL_ID,
+                            Username=cognito_username,
+                            GroupName=updated_data["role"]
+                        )
+                    except ClientError as e:
+                        print(f"Failed to add user to group: {e}")
+        except Exception as e:
+            print(f"Cognito sync error: {e}")
 
-    # If isBanned changed, update enable/disable in Cognito
+    # Handle ban status
     if "isBanned" in updated_data:
         try:
             if check_aws_credentials():
-                if updated_data["isBanned"]:
-                    cognito_client.admin_disable_user(UserPoolId=USER_POOL_ID, Username=email)
-                else:
-                    cognito_client.admin_enable_user(UserPoolId=USER_POOL_ID, Username=email)
-            else:
-                print("WARNING: AWS credentials not configured. Skipping Cognito enable/disable.")
-        except NoCredentialsError:
-            print("WARNING: No AWS credentials available; skipping Cognito status update.")
-        except ClientError as e:
-            print("Cognito status update error:", str(e))
+                cognito_username = get_cognito_username_by_email(email)
+                if cognito_username:
+                    if updated_data["isBanned"]:
+                        cognito_client.admin_disable_user(
+                            UserPoolId=USER_POOL_ID,
+                            Username=cognito_username
+                        )
+                    else:
+                        cognito_client.admin_enable_user(
+                            UserPoolId=USER_POOL_ID,
+                            Username=cognito_username
+                        )
+        except Exception as e:
+            print(f"Cognito status update error: {e}")
 
-    # Return updated user
     user = users_collection.find_one({"email": updated_data.get("email", email)}, {"_id": 0})
     return user
 
-# Transactions / rules / logs unchanged (kept as-is)
+# Transactions endpoints
 @app.get("/api/transactions")
 async def get_transactions():
     transactions_collection = db.get_collection("transactions")
@@ -238,6 +225,7 @@ async def update_transaction(transaction_id: str, updated_data: dict):
     transaction = transactions_collection.find_one({"id": transaction_id}, {"_id": 0})
     return transaction
 
+# Rules endpoints
 @app.get("/api/rules")
 async def get_rules():
     rules_collection = db.get_collection("rules")
@@ -258,6 +246,7 @@ async def delete_rule(rule_id: str):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"message": "Rule deleted successfully"}
 
+# Logs endpoints
 @app.get("/api/logs")
 async def get_logs():
     logs = list(logs_collection.find({}, {"_id": 0}))
@@ -277,6 +266,4 @@ async def startup_event():
         print("✓ AWS credentials configured")
     else:
         print("⚠ WARNING: AWS credentials NOT configured!")
-        print("  Cognito integration will be skipped.")
-        print("  To configure: run 'aws configure' or set AWS env variables")
     print("=" * 50)

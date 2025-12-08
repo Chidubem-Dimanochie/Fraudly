@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { signInWithRedirect } from 'aws-amplify/auth';
+import { signInWithRedirect, signOut } from 'aws-amplify/auth';
 
 const Shield: React.FC<{ className?: string }> = ({ className }) => (
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -12,6 +12,7 @@ const Shield: React.FC<{ className?: string }> = ({ className }) => (
 const Login: React.FC = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [localError, setLocalError] = useState<string | null>(null);
 
   const { login, user, isLoading, error } = useAuth();
   const navigate = useNavigate();
@@ -26,24 +27,43 @@ const Login: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLocalError(null);
     if (!email || !password) return;
 
     try {
       // Local/Mock login fallback
       await login(email, password);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Login failed:", err);
+      setLocalError(err.message || "Login failed");
     }
   };
 
   const handleSSOLogin = async () => {
+    setLocalError(null);
     try {
       // Triggers the AWS Cognito Hosted UI redirect
       await signInWithRedirect();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to start SSO flow:", err);
+      
+      // Handle case where user is already signed in
+      if (err.name === 'UserAlreadyAuthenticatedException') {
+        // Sign out first, then try again
+        try {
+          await signOut();
+          await signInWithRedirect();
+        } catch (retryErr) {
+          console.error("Retry failed:", retryErr);
+          setLocalError("Please refresh the page and try again.");
+        }
+      } else {
+        setLocalError("Failed to start SSO login. Please try again.");
+      }
     }
   };
+
+  const displayError = localError || error;
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 px-4 sm:px-6 lg:px-8 relative">
@@ -75,10 +95,10 @@ const Login: React.FC = () => {
               type="button"
               className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
             >
-              Sign in with Corporate SSO
+              Sign in with Cognito
             </button>
             <p className="text-xs text-center text-gray-400 mt-2">
-              Redirects to AWS Cognito
+              
             </p>
           </div>
 
@@ -131,8 +151,10 @@ const Login: React.FC = () => {
               </div>
             </div>
 
-            {error && (
-              <p className="text-red-500 text-sm text-center">{error}</p>
+            {displayError && (
+              <div className="rounded-md bg-red-50 p-4">
+                <p className="text-sm text-red-800">{displayError}</p>
+              </div>
             )}
 
             <div>
