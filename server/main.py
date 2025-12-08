@@ -17,6 +17,8 @@ USER_POOL_ID = 'us-east-1_HgEmPHJj8'
 origins = [
     "http://localhost:3000",
     "http://10.88.7.176:3000",
+    "https://main.d3sba06ap3p2l2.amplifyapp.com",
+
 ]
 
 app.add_middleware(
