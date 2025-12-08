@@ -4,11 +4,15 @@ import { UserRole, Transaction, TransactionStatus, User, AuditLog, FraudRule } f
 import AdminDashboard from './AdminDashboard';
 import EmployeeDashboard from './EmployeeDashboard';
 import CustomerDashboard from './CustomerDashboard';
+import { useNavigate } from 'react-router-dom';
 
-const API_URL = 'http://localhost:8000';
+// Use a consistent API base. Ideally imported from a config file.
+const API_BASE = 'http://localhost:8000/api';
 
 const Dashboard: React.FC = () => {
-  const { user, updateUser, updateUserDetails, transferFunds } = useAuth();
+  // ✅ Call useAuth ONLY at the top level
+  const { user, users, updateUser, updateUserDetails, transferFunds, logout } = useAuth();
+  const navigate = useNavigate();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [lastTransaction, setLastTransaction] = useState<Transaction | undefined>();
   const [isLoading, setIsLoading] = useState(false);
@@ -21,9 +25,9 @@ const Dashboard: React.FC = () => {
     const fetchData = async () => {
         try {
             const [txnsRes, rulesRes, logsRes] = await Promise.all([
-                fetch(`${API_URL}/api/transactions`),
-                fetch(`${API_URL}/api/rules`),
-                fetch(`${API_URL}/api/logs`),
+                fetch(`${API_BASE}/transactions`),
+                fetch(`${API_BASE}/rules`),
+                fetch(`${API_BASE}/logs`),
             ]);
             if (!txnsRes.ok || !rulesRes.ok || !logsRes.ok) {
                 throw new Error('Failed to fetch initial data.');
@@ -38,13 +42,18 @@ const Dashboard: React.FC = () => {
 
         } catch (e: any) {
             console.error("Data fetch error:", e.message);
-            //setError("Could not load data from the server. Please ensure the backend is running.");
+            setError("Could not load data from the server. Please ensure the backend is running at http://localhost:8000");
         }
     };
     fetchData();
   }, []);
 
   if (!user) return null;
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/');
+  };
   
   const addAuditLog = async (action: string, details: string) => {
     const newLog: Omit<AuditLog, 'id'> & { id: string } = {
@@ -57,11 +66,15 @@ const Dashboard: React.FC = () => {
     // Update UI immediately
     setAuditLogs(prev => [newLog, ...prev]);
     // Persist to DB
-    await fetch(`${API_URL}/api/logs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newLog),
-    });
+    try {
+        await fetch(`${API_BASE}/logs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newLog),
+        });
+    } catch (err) {
+        console.error("Failed to save audit log:", err);
+    }
   };
 
   const handleAddTransaction = async (newTransactionData: Omit<Transaction, 'id' | 'userEmail'| 'status' | 'reason' | 'timestamp'>) => {
@@ -129,7 +142,7 @@ const Dashboard: React.FC = () => {
     setLastTransaction(newTransaction);
     
     // Persist transaction to DB
-    await fetch(`${API_URL}/api/transactions`, {
+    await fetch(`${API_BASE}/transactions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newTransaction),
@@ -163,7 +176,7 @@ const Dashboard: React.FC = () => {
       try {
           if (!updatedTransaction) throw new Error("Could not find transaction to update.");
           const { status, analystNotes } = updatedTransaction;
-          const response = await fetch(`${API_URL}/api/transactions/${transactionId}`, {
+          const response = await fetch(`${API_BASE}/transactions/${transactionId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ status, analystNotes }),
@@ -177,18 +190,25 @@ const Dashboard: React.FC = () => {
       }
   };
 
-  const handleUserUpdate = (email: string, data: Partial<User>) => {
+  // ✅ Fixed: Use users from top-level hook, not calling useAuth() again
+  const handleUserUpdate = async (email: string, data: Partial<User>) => {
       // Find the user to get their original state for logging
-      const targetUser = useAuth().users.find(u => u.email === email);
-      if (!targetUser) return;
+      const targetUser = users.find(u => u.email === email);
+      if (!targetUser) {
+          console.error("User not found:", email);
+          throw new Error("User not found");
+      }
+      
+      // Log changes
       if (data.role && data.role !== targetUser.role) {
-          addAuditLog('USER_ROLE_CHANGE', `Changed ${email}'s role from ${targetUser.role} to ${data.role}.`);
+          await addAuditLog('USER_ROLE_CHANGE', `Changed ${email}'s role from ${targetUser.role} to ${data.role}.`);
       }
       if (data.isBanned !== undefined && data.isBanned !== targetUser.isBanned) {
-          addAuditLog('USER_STATUS_CHANGE', `${data.isBanned ? 'Banned' : 'Unbanned'} user ${email}.`);
+          await addAuditLog('USER_STATUS_CHANGE', `${data.isBanned ? 'Banned' : 'Unbanned'} user ${email}.`);
       }
+      
       // This function from AuthContext handles the API call and UI update
-      updateUserDetails(email, data);
+      await updateUserDetails(email, data);
   };
 
   const handleRuleAdd = async (rule: Omit<FraudRule, 'id'>) => {
@@ -197,7 +217,7 @@ const Dashboard: React.FC = () => {
       setFraudRules(prev => [...prev, newRule]);
       addAuditLog('FRAUD_RULE_ADD', `Added new rule: ${newRule.description}`);
       // Persist to DB
-      await fetch(`${API_URL}/api/rules`, {
+      await fetch(`${API_BASE}/rules`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(newRule)
@@ -211,7 +231,7 @@ const Dashboard: React.FC = () => {
         setFraudRules(prev => prev.filter(r => r.id !== ruleId));
         addAuditLog('FRAUD_RULE_DELETE', `Deleted rule: ${ruleToDelete.description}`);
         // Persist to DB
-        await fetch(`${API_URL}/api/rules/${ruleId}`, { method: 'DELETE' });
+        await fetch(`${API_BASE}/rules/${ruleId}`, { method: 'DELETE' });
       }
   };
 
@@ -261,7 +281,7 @@ const Dashboard: React.FC = () => {
               {user.email}
             </span>
             <button
-              onClick={useAuth().logout}
+              onClick={handleLogout}
               className="py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
             >
               Logout

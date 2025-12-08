@@ -111,11 +111,56 @@ const OverviewTab: React.FC<{
 
 
 // --- User Management Tab ---
-const UserManagementTab: React.FC<{ users: User[], onUserUpdate: (email: string, data: Partial<User>) => void }> = ({ users, onUserUpdate }) => {
+const UserManagementTab: React.FC<{ 
+    users: User[], 
+    onUserUpdate: (email: string, data: Partial<User>) => Promise<void> 
+}> = ({ users, onUserUpdate }) => {
     const { user: currentUser } = useAuth();
+    const [loadingUser, setLoadingUser] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
+
+    const handleRoleChange = async (email: string, newRole: UserRole) => {
+        setLoadingUser(email);
+        setError(null);
+        try {
+            await onUserUpdate(email, { role: newRole });
+        } catch (err: any) {
+            setError(`Failed to update role for ${email}: ${err.message || 'Unknown error'}`);
+            console.error('Role update error:', err);
+        } finally {
+            setLoadingUser(null);
+        }
+    };
+
+    const handleBanToggle = async (email: string, currentBanStatus: boolean) => {
+        setLoadingUser(email);
+        setError(null);
+        try {
+            await onUserUpdate(email, { isBanned: !currentBanStatus });
+        } catch (err: any) {
+            setError(`Failed to update ban status for ${email}: ${err.message || 'Unknown error'}`);
+            console.error('Ban toggle error:', err);
+        } finally {
+            setLoadingUser(null);
+        }
+    };
+
     return (
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6">
             <h3 className="text-lg font-semibold mb-4">User Management</h3>
+            
+            {error && (
+                <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded flex justify-between items-center">
+                    <span>{error}</span>
+                    <button 
+                        onClick={() => setError(null)}
+                        className="text-red-700 hover:text-red-900 font-bold"
+                    >
+                        ×
+                    </button>
+                </div>
+            )}
+
             <div className="overflow-x-auto">
                 <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                     <thead className="bg-gray-50 dark:bg-gray-900/50">
@@ -128,26 +173,38 @@ const UserManagementTab: React.FC<{ users: User[], onUserUpdate: (email: string,
                     </thead>
                     <tbody className="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
                         {users.map(u => (
-                            <tr key={u.email}>
+                            <tr key={u.email} className={loadingUser === u.email ? 'opacity-50' : ''}>
                                 <td className="px-6 py-4 whitespace-nowrap text-sm">{u.email}</td>
                                 <td className="px-6 py-4 whitespace-nowrap text-sm">
                                     <select 
                                         value={u.role} 
-                                        onChange={e => onUserUpdate(u.email, { role: e.target.value as UserRole })} 
+                                        onChange={e => handleRoleChange(u.email, e.target.value as UserRole)}
                                         className="p-1 border rounded dark:bg-gray-700 dark:border-gray-600"
-                                        disabled={u.email === currentUser?.email} // Admins cannot change their own role
+                                        disabled={u.email === currentUser?.email || loadingUser === u.email}
                                     >
-                                        {Object.values(UserRole).map(role => <option key={role} value={role}>{role}</option>)}
+                                        {Object.values(UserRole).map(role => 
+                                            <option key={role} value={role}>{role}</option>
+                                        )}
                                     </select>
                                 </td>
-                                <td className="px-6 py-4 whitespace-nowrap text-sm">{u.isBanned ? 'Banned' : 'Active'}</td>
+                                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                    <span className={`px-2 py-1 rounded text-xs font-medium ${
+                                        u.isBanned 
+                                            ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300' 
+                                            : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300'
+                                    }`}>
+                                        {u.isBanned ? 'Banned' : 'Active'}
+                                    </span>
+                                </td>
                                 <td className="px-6 py-4 whitespace-nowrap text-sm">
                                     <button 
-                                        onClick={() => onUserUpdate(u.email, { isBanned: !u.isBanned })} 
-                                        className={`py-1 px-3 rounded ${u.isBanned ? 'bg-green-500' : 'bg-red-500'} text-white disabled:bg-gray-400`}
-                                        disabled={u.email === currentUser?.email} // Admins cannot ban themselves
+                                        onClick={() => handleBanToggle(u.email, u.isBanned)}
+                                        className={`py-1 px-3 rounded ${
+                                            u.isBanned ? 'bg-green-500 hover:bg-green-600' : 'bg-red-500 hover:bg-red-600'
+                                        } text-white disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors`}
+                                        disabled={u.email === currentUser?.email || loadingUser === u.email}
                                     >
-                                        {u.isBanned ? 'Unban' : 'Ban'}
+                                        {loadingUser === u.email ? '...' : (u.isBanned ? 'Unban' : 'Ban')}
                                     </button>
                                 </td>
                             </tr>
@@ -263,7 +320,7 @@ interface AdminDashboardProps {
     auditLogs: AuditLog[];
     fraudRules: FraudRule[];
     onStatusUpdate: (transactionId: string, newStatus: any, note: string) => void;
-    onUserUpdate: (email: string, data: Partial<User>) => void;
+    onUserUpdate: (email: string, data: Partial<User>) => Promise<void>;
     onRuleAdd: (rule: Omit<FraudRule, 'id'>) => void;
     onRuleDelete: (ruleId: string) => void;
 }
