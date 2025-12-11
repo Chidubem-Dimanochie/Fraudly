@@ -24,24 +24,38 @@ const Dashboard: React.FC = () => {
   useEffect(() => {
     const fetchData = async () => {
         try {
+            console.log('📥 Fetching dashboard data...');
             const [txnsRes, rulesRes, logsRes] = await Promise.all([
                 fetch(`${API_BASE}/transactions`),
-                fetch(`${API_BASE}/rules`),
-                fetch(`${API_BASE}/logs`),
+                fetch(`${API_BASE}/fraud-rules`),  // ✅ uses new endpoint
+                fetch(`${API_BASE}/audit-logs`),   // ✅ uses new endpoint
             ]);
+            
             if (!txnsRes.ok || !rulesRes.ok || !logsRes.ok) {
+                console.error('❌ Failed to fetch:', {
+                    transactions: txnsRes.status,
+                    rules: rulesRes.status,
+                    logs: logsRes.status
+                });
                 throw new Error('Failed to fetch initial data.');
             }
+            
             const txns = await txnsRes.json();
             const rules = await rulesRes.json();
             const logs = await logsRes.json();
+
+            console.log('✅ Data fetched:', {
+                transactions: txns.length,
+                rules: rules.length,
+                logs: logs.length
+            });
 
             setTransactions(txns);
             setFraudRules(rules);
             setAuditLogs(logs);
 
         } catch (e: any) {
-            console.error("Data fetch error:", e.message);
+            console.error("❌ Data fetch error:", e.message);
             setError("Could not load data from the server. Please ensure the backend is running at http://localhost:8000");
         }
     };
@@ -56,24 +70,33 @@ const Dashboard: React.FC = () => {
   };
   
   const addAuditLog = async (action: string, details: string) => {
-    const newLog: Omit<AuditLog, 'id'> & { id: string } = {
-        id: `log_${Date.now()}`,
+    const newLog = {
         timestamp: new Date().toISOString(),
         actor: user.email,
         action,
         details
     };
-    // Update UI immediately
-    setAuditLogs(prev => [newLog, ...prev]);
-    // Persist to DB
+    
+    console.log('📝 Adding audit log:', newLog);
+    
+    // Persist to DB first to get the ID
     try {
-        await fetch(`${API_BASE}/logs`, {
+        const response = await fetch(`${API_BASE}/audit-logs`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(newLog),
         });
+        
+        if (!response.ok) {
+            throw new Error('Failed to save audit log');
+        }
+        
+        const savedLog = await response.json();
+        // Update UI with the log that includes the server-generated ID
+        setAuditLogs(prev => [savedLog, ...prev]);
+        console.log('✅ Audit log saved');
     } catch (err) {
-        console.error("Failed to save audit log:", err);
+        console.error("❌ Failed to save audit log:", err);
     }
   };
 
@@ -122,9 +145,8 @@ const Dashboard: React.FC = () => {
         alert(`ALERT: Transaction of $${newTransactionData.amount.toFixed(2)} is over your set threshold of $${user.alertThreshold}.`);
     }
 
-    const newTransaction: Transaction & { id: string } = {
+    const newTransactionPayload = {
       ...newTransactionData,
-      id: `txn_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       userEmail: user.email,
       status,
       reason,
@@ -132,23 +154,37 @@ const Dashboard: React.FC = () => {
       analystNotes: [],
     };
     
-    // Update user balance if transaction is not fraudulent
-    if (status !== 'fraudulent') {
-        updateUser({ balance: user.balance - newTransactionData.amount });
-    }
-
-    // Update UI immediately
-    setTransactions(prev => [newTransaction, ...prev]);
-    setLastTransaction(newTransaction);
+    console.log('💳 Creating transaction:', newTransactionPayload);
     
-    // Persist transaction to DB
-    await fetch(`${API_BASE}/transactions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newTransaction),
-    });
+    try {
+        // Persist transaction to DB
+        const response = await fetch(`${API_BASE}/transactions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newTransactionPayload),
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to create transaction');
+        }
+        
+        const savedTransaction = await response.json();
+        console.log('✅ Transaction created:', savedTransaction.id);
+        
+        // Update user balance if transaction is not fraudulent
+        if (status !== 'fraudulent') {
+            updateUser({ balance: user.balance - newTransactionData.amount });
+        }
 
-    setIsLoading(false);
+        // Update UI with saved transaction (includes server-generated ID)
+        setTransactions(prev => [savedTransaction, ...prev]);
+        setLastTransaction(savedTransaction);
+    } catch (err) {
+        console.error('❌ Failed to create transaction:', err);
+        setError('Failed to process transaction. Please try again.');
+    } finally {
+        setIsLoading(false);
+    }
   };
 
   const handleStatusUpdate = async (transactionId: string, newStatus: TransactionStatus, note: string) => {
@@ -176,62 +212,103 @@ const Dashboard: React.FC = () => {
       try {
           if (!updatedTransaction) throw new Error("Could not find transaction to update.");
           const { status, analystNotes } = updatedTransaction;
+          
+          console.log('🔄 Updating transaction:', transactionId);
+          
           const response = await fetch(`${API_BASE}/transactions/${transactionId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ status, analystNotes }),
           });
+          
           if (!response.ok) throw new Error("Server failed to update transaction.");
+          
+          console.log('✅ Transaction updated');
       } catch (err) {
-          console.error("Failed to update transaction:", err);
+          console.error("❌ Failed to update transaction:", err);
           // Revert UI on failure
           setTransactions(originalTransactions);
           alert("Error: Could not update transaction status.");
       }
   };
 
-  // ✅ Fixed: Use users from top-level hook, not calling useAuth() again
-  const handleUserUpdate = async (email: string, data: Partial<User>) => {
+  const handleUserUpdate = async (username: string, data: Partial<User>) => {
       // Find the user to get their original state for logging
-      const targetUser = users.find(u => u.email === email);
+      const targetUser = users.find(u => u.username === username);
       if (!targetUser) {
-          console.error("User not found:", email);
+          console.error("User not found:", username);
           throw new Error("User not found");
       }
       
+      console.log('👤 Updating user:', username, data);
+      
       // Log changes
-      if (data.role && data.role !== targetUser.role) {
-          await addAuditLog('USER_ROLE_CHANGE', `Changed ${email}'s role from ${targetUser.role} to ${data.role}.`);
-      }
+      if (data.role !== undefined && data.role !== targetUser.role) {
+        await addAuditLog(
+            "USER_ROLE_CHANGE",
+            `Changed ${targetUser.email}'s role from ${targetUser.role} to ${data.role}.`
+        );
+    }
       if (data.isBanned !== undefined && data.isBanned !== targetUser.isBanned) {
-          await addAuditLog('USER_STATUS_CHANGE', `${data.isBanned ? 'Banned' : 'Unbanned'} user ${email}.`);
+          await addAuditLog('USER_STATUS_CHANGE', `${data.isBanned ? 'Banned' : 'Unbanned'} user ${targetUser.email}.`);
       }
       
       // This function from AuthContext handles the API call and UI update
-      await updateUserDetails(email, data);
+      await updateUserDetails(username, data);
+      console.log('✅ User updated');
   };
 
   const handleRuleAdd = async (rule: Omit<FraudRule, 'id'>) => {
-      const newRule = { ...rule, id: `rule_${Date.now()}`};
-      // Update UI immediately
-      setFraudRules(prev => [...prev, newRule]);
-      addAuditLog('FRAUD_RULE_ADD', `Added new rule: ${newRule.description}`);
-      // Persist to DB
-      await fetch(`${API_BASE}/rules`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(newRule)
-      });
+      console.log('➕ Adding fraud rule:', rule);
+      
+      try {
+          // Persist to DB first to get server-generated ID
+          const response = await fetch(`${API_BASE}/fraud-rules`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(rule)
+          });
+          
+          if (!response.ok) {
+              throw new Error('Failed to create fraud rule');
+          }
+          
+          const newRule = await response.json();
+          console.log('✅ Fraud rule created:', newRule.id);
+          
+          // Update UI with saved rule
+          setFraudRules(prev => [...prev, newRule]);
+          addAuditLog('FRAUD_RULE_ADD', `Added new rule: ${newRule.description}`);
+      } catch (err) {
+          console.error('❌ Failed to add fraud rule:', err);
+          alert('Failed to add fraud rule. Please try again.');
+      }
   };
 
   const handleRuleDelete = async (ruleId: string) => {
       const ruleToDelete = fraudRules.find(r => r.id === ruleId);
       if (ruleToDelete) {
-        // Update UI immediately
-        setFraudRules(prev => prev.filter(r => r.id !== ruleId));
-        addAuditLog('FRAUD_RULE_DELETE', `Deleted rule: ${ruleToDelete.description}`);
-        // Persist to DB
-        await fetch(`${API_BASE}/rules/${ruleId}`, { method: 'DELETE' });
+        console.log('🗑️ Deleting fraud rule:', ruleId);
+        
+        try {
+            // Persist to DB
+            const response = await fetch(`${API_BASE}/fraud-rules/${ruleId}`, { 
+                method: 'DELETE' 
+            });
+            
+            if (!response.ok) {
+                throw new Error('Failed to delete fraud rule');
+            }
+            
+            console.log('✅ Fraud rule deleted');
+            
+            // Update UI
+            setFraudRules(prev => prev.filter(r => r.id !== ruleId));
+            addAuditLog('FRAUD_RULE_DELETE', `Deleted rule: ${ruleToDelete.description}`);
+        } catch (err) {
+            console.error('❌ Failed to delete fraud rule:', err);
+            alert('Failed to delete fraud rule. Please try again.');
+        }
       }
   };
 
@@ -277,9 +354,15 @@ const Dashboard: React.FC = () => {
           </h1>
           <div className="flex items-center space-x-4">
              {error && <p className="text-red-500 text-sm hidden sm:block">{error}</p>}
-            <span className="hidden sm:inline text-gray-600 dark:text-gray-300">
-              {user.email}
-            </span>
+            <div className="hidden sm:block text-right">
+              <div className="text-sm font-medium text-gray-900 dark:text-white">
+                {/* 👇 Use fullName if present, otherwise fall back to username */}
+                {user.fullName || user.username}
+              </div>
+              <div className="text-xs text-gray-600 dark:text-gray-400">
+                {user.email}
+              </div>
+            </div>
             <button
               onClick={handleLogout}
               className="py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"

@@ -107,11 +107,11 @@ const Login: React.FC = () => {
               <div className="w-full border-t border-gray-300" />
             </div>
             <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-white text-gray-500">Or use legacy credentials</span>
+            {/* <span className="px-2 bg-white text-gray-500">Or use legacy credentials</span> */}
             </div>
           </div>
 
-          {/* SECONDARY METHOD: Username/Password Form */}
+          {/* SECONDARY METHOD: Username/Password Form
           <form className="space-y-6" onSubmit={handleSubmit}>
             <div className="rounded-md shadow-sm -space-y-px">
               <div>
@@ -166,10 +166,10 @@ const Login: React.FC = () => {
                            focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 
                            disabled:bg-gray-100 disabled:cursor-not-allowed"
               >
-                {isLoading ? 'Signing in...' : 'Sign in with Password'}
-              </button>
+                {isLoading ? 'Signing in...' : 'Sign in with Password'} */}
+              {/* </button> */}
             </div>
-          </form>
+          {/* </form> */}
         </div>
 
         {/* Back to Home Link - Bottom Text */}
@@ -179,7 +179,7 @@ const Login: React.FC = () => {
             </Link>
         </div>
       </div>
-    </div>
+    //</div>
   );
 };
 

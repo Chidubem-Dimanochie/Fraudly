@@ -5,10 +5,10 @@ export enum UserRole {
   Admin = 'Admin',
 }
 
-// Represents the structure of a user object.
 export interface User {
-  username: string;  // NEW: Unique username (from Cognito preferred_username or custom)
-  email: string;     // Email address
+  username: string;      // Cognito username (unique identifier, e.g., "johndoe" or UUID)
+  email: string;         // User's email address (e.g., "john@example.com")
+  fullName?: string;     // ✅ Single full name field from Cognito's "name" attribute
   role: UserRole;
   balance: number;
   cardFrozen: boolean;
