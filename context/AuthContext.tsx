@@ -5,8 +5,13 @@ import React, {
   ReactNode,
   useEffect,
 } from "react";
-import { signIn, signOut, getCurrentUser } from "aws-amplify/auth";
-import { fetchAuthSession } from "aws-amplify/auth";
+import {
+  signIn,
+  signOut,
+  getCurrentUser,
+  fetchAuthSession,
+  fetchUserAttributes,
+} from "aws-amplify/auth";
 
 // -------------------------
 // Types
@@ -18,9 +23,9 @@ export enum UserRole {
 }
 
 export interface User {
-  username: string; // Cognito username (unique identifier)
-  email: string; // User's email address
-  fullName?: string; // Single full name field
+  username: string;
+  email: string;
+  fullName?: string;
   role: UserRole;
   balance: number;
   cardFrozen: boolean;
@@ -28,54 +33,185 @@ export interface User {
   isBanned: boolean;
 }
 
-// -------------------------
-// API base URL
-// -------------------------
 const API_BASE_URL = "http://localhost:8000/api";
 
-// -------------------------
 interface AuthContextType {
   user: User | null;
   users: User[];
   isLoading: boolean;
   error: string | null;
+
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+
   syncUserFromCognito: () => Promise<void>;
-  updateUser: (updatedData: Partial<User>) => void;
-  updateUserDetails: (username: string, updatedData: Partial<User>) => void;
+
+  refreshUsers: () => Promise<void>;
+  refreshCurrentUser: () => Promise<void>;
+
+  updateUser: (updatedData: Partial<User>) => Promise<void>;
+  updateUserDetails: (username: string, updatedData: Partial<User>) => Promise<void>;
+
   transferFunds: (recipientEmail: string, amount: number) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
-// -------------------------
-export const AuthProvider: React.FC<{ children: ReactNode }> = ({
-  children,
-}) => {
+export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [users, setUsers] = useState<User[]>([]);
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // -------------------------
-  // HELPER: Refresh tokens if needed
-  // -------------------------
   const ensureValidSession = async (): Promise<boolean> => {
     try {
       const session = await fetchAuthSession({ forceRefresh: true });
-
-      if (session.tokens?.accessToken) {
-        console.log("✅ Valid session obtained");
-        return true;
-      }
-
-      console.warn("⚠️ No valid tokens after refresh");
-      return false;
+      return !!session.tokens?.accessToken;
     } catch (err: any) {
-      console.error("❌ Session refresh failed:", err.message);
+      console.error("❌ Session refresh failed:", err?.message);
       return false;
     }
+  };
+
+  const refreshUsers = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/users`);
+      if (!res.ok) throw new Error("Failed to fetch users.");
+      const allUsers: User[] = await res.json();
+      setUsers(allUsers);
+    } catch (e) {
+      console.warn("⚠️ refreshUsers failed:", e);
+    }
+  };
+
+  const refreshCurrentUser = async () => {
+    if (!user?.email) return;
+    try {
+      const res = await fetch(
+        `${API_BASE_URL}/users/by-email/${encodeURIComponent(user.email)}`
+      );
+      if (!res.ok) return;
+      const fresh: User = await res.json();
+      setUser(fresh);
+      setUsers((prev) => prev.map((u) => (u.username === fresh.username ? fresh : u)));
+    } catch (e) {
+      console.warn("⚠️ refreshCurrentUser failed:", e);
+    }
+  };
+
+  // ✅ Cognito attributes (frontend-only)
+  const getNameFromCognitoAttributes = async (): Promise<string | undefined> => {
+    try {
+      const attrs = await fetchUserAttributes();
+      const name = (attrs as any)?.name || (attrs as any)?.["custom:name"];
+      return name && name.trim().length > 0 ? name.trim() : undefined;
+    } catch (e) {
+      console.warn("⚠️ fetchUserAttributes failed:", e);
+      return undefined;
+    }
+  };
+
+  // ✅ When banned: signOut + clear local user + throw "Account is banned"
+  const handleBannedUser = async () => {
+    setUser(null);
+    setError("Account is banned");
+    try {
+      await signOut();
+    } catch (e) {
+      console.warn("⚠️ signOut failed while banning:", e);
+    }
+    throw new Error("Account is banned");
+  };
+
+  // -------------------------
+  // Core Sync (Mongo source of truth)
+  // - find by email
+  // - create if missing
+  // - fill missing fullName
+  // - if banned -> signOut + throw
+  // -------------------------
+  const performSync = async (cognitoUsername: string, email: string) => {
+    console.log("🔄 Sync start:", { cognitoUsername, email });
+
+    // 1) Find Mongo user by email
+    let existingUser: User | null = null;
+    try {
+      const res = await fetch(
+        `${API_BASE_URL}/users/by-email/${encodeURIComponent(email)}`
+      );
+      if (res.ok) {
+        existingUser = (await res.json()) as User;
+      }
+    } catch (e) {
+      console.warn("⚠️ /users/by-email lookup failed:", e);
+    }
+
+    // 2) Create if missing
+    if (!existingUser) {
+      const fullNameFromAttrs = await getNameFromCognitoAttributes();
+
+      const newUser: User = {
+        username: cognitoUsername,
+        email,
+        fullName: fullNameFromAttrs,
+        role: UserRole.Customer, // ✅ do NOT set from Cognito groups
+        balance: 10000,
+        cardFrozen: false,
+        alertThreshold: null,
+        isBanned: false,
+      };
+
+      const createRes = await fetch(`${API_BASE_URL}/users`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newUser),
+      });
+
+      if (!createRes.ok) {
+        const t = await createRes.text();
+        throw new Error(t || "Failed to create user");
+      }
+
+      existingUser = (await createRes.json()) as User;
+    }
+
+    // ✅ Ban check immediately after we have Mongo user
+    if (existingUser.isBanned) {
+      await handleBannedUser();
+      return; // (unreachable, but keeps TS happy)
+    }
+
+    // 3) Fill missing fullName (Mongo)
+    if (!existingUser.fullName) {
+      const fullNameFromAttrs = await getNameFromCognitoAttributes();
+      if (fullNameFromAttrs) {
+        try {
+          const updateRes = await fetch(
+            `${API_BASE_URL}/users/email/${encodeURIComponent(email)}`,
+            {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ fullName: fullNameFromAttrs }),
+            }
+          );
+
+          if (updateRes.ok) {
+            existingUser = (await updateRes.json()) as User;
+          }
+        } catch (e) {
+          console.warn("⚠️ fullName update exception:", e);
+        }
+      }
+    }
+
+    // ✅ Ban check again (in case it was updated while syncing)
+    if (existingUser.isBanned) {
+      await handleBannedUser();
+      return;
+    }
+
+    setUser(existingUser);
+    await refreshUsers();
   };
 
   // -------------------------
@@ -84,57 +220,37 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
   useEffect(() => {
     const initializeAuth = async () => {
       setIsLoading(true);
+      setError(null);
+
       try {
-        console.log("🚀 Initializing auth...");
+        await refreshUsers();
 
-        // 1. Check if backend is alive and get users
-        const res = await fetch(`${API_BASE_URL}/users`);
-        if (!res.ok) throw new Error("Failed to fetch users from backend.");
-        const allUsers: User[] = await res.json();
-        setUsers(allUsers);
-        console.log("✅ Fetched users from backend:", allUsers.length);
-
-        // 2. Check if a Cognito session exists
         try {
           const cognitoUser = await getCurrentUser();
-          console.log("🔍 Cognito user found:", cognitoUser);
 
-          // 3. Ensure we have valid tokens (refresh if needed)
           const hasValidSession = await ensureValidSession();
-
           if (!hasValidSession) {
-            console.log("❌ Could not obtain valid session, signing out...");
             await signOut();
+            setUser(null);
             return;
           }
 
-          // 4. Get email + full name from ID token (Cognito "Name" field)
-          const username = cognitoUser.username;
           const session = await fetchAuthSession();
-          const idToken = session.tokens?.idToken?.payload || {};
-          const email = idToken.email as string | undefined;
-          const fullName = idToken.name as string | undefined; // 👈 full name
+          const idTokenPayload = session.tokens?.idToken?.payload || {};
+          const email = idTokenPayload.email as string | undefined;
 
-          console.log("📧 Username:", username);
-          console.log("📧 Email from ID token:", email);
-          console.log("📛 Full name from Cognito:", fullName);
+          if (!email) throw new Error("Email not found in session");
 
-          if (!email) {
-            console.error("❌ No email found in ID token");
-            throw new Error("Email not found in session");
+          await performSync(cognitoUser.username, email);
+        } catch (err: any) {
+          // ✅ if banned, performSync already handled signOut + error
+          if (String(err?.message || "").toLowerCase().includes("banned")) {
+            return;
           }
-
-          if (username && email) {
-            await performSync(username, email, fullName, allUsers);
-          }
-        } catch (e: any) {
-          // No user signed in
           console.log("ℹ️ No active session found.");
         }
       } catch (e: any) {
-        setError(
-          "Could not connect to the backend server. Is it running on port 8000?"
-        );
+        setError("Could not connect to the backend server. Is it running on port 8000?");
         console.error("❌ Initialization error:", e);
       } finally {
         setIsLoading(false);
@@ -142,191 +258,38 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
     };
 
     initializeAuth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // -------------------------
-  // HELPER: Determine role from Cognito groups
-  // -------------------------
-  const getRoleFromCognito = async (): Promise<UserRole> => {
-    let role: UserRole = UserRole.Customer;
-    try {
-      const session = await fetchAuthSession();
-      const groups = session.tokens?.accessToken?.payload?.[
-        "cognito:groups"
-      ] as string[] | undefined;
-      console.log("🔍 Cognito groups:", groups);
-
-      if (groups && groups.length > 0) {
-        if (groups.includes("Admin")) role = UserRole.Admin;
-        else if (groups.includes("Employee")) role = UserRole.Employee;
-        else role = UserRole.Customer;
-      }
-    } catch (err) {
-      console.warn(
-        "⚠️ Could not fetch Cognito groups, defaulting to Customer role"
-      );
-    }
-    return role;
-  };
-
-  // -------------------------
-  // HELPER: Core Sync Logic
-  // -------------------------
-  const performSync = async (
-    username: string,
-    email: string,
-    fullNameFromCognito: string | undefined,
-    currentUsersList: User[]
-  ) => {
-    console.log(`🔄 Syncing user: ${username} (${email})`);
-
-    let existingUser = currentUsersList.find((u) => u.username === username);
-
-    if (!existingUser) {
-      console.log(`📝 User ${username} not found in MongoDB. Creating...`);
-
-      const role = await getRoleFromCognito();
-
-      const newUser: User = {
-        username,
-        email,
-        fullName: fullNameFromCognito || username, // fallback if name missing
-        role,
-        balance: 10000,
-        cardFrozen: false,
-        alertThreshold: null,
-        isBanned: false,
-      };
-
-      console.log(
-        "📤 Sending new user to backend:",
-        JSON.stringify(newUser, null, 2)
-      );
-
-      try {
-        const createRes = await fetch(`${API_BASE_URL}/users`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(newUser),
-        });
-
-        if (!createRes.ok) {
-          const errorText = await createRes.text();
-          console.error(
-            "❌ Failed to create user. Status:",
-            createRes.status
-          );
-          console.error("❌ Error response:", errorText);
-
-          try {
-            const errorJson = JSON.parse(errorText);
-            console.error("❌ Parsed error details:", errorJson);
-          } catch {
-            console.error("❌ Could not parse error as JSON");
-          }
-
-          throw new Error(errorText);
-        }
-
-        existingUser = (await createRes.json()) as User;
-        console.log("✅ User created successfully:", existingUser);
-
-        setUsers((prev) => [...prev, existingUser!]);
-      } catch (err) {
-        console.error("❌ Error creating user:", err);
-        throw err;
-      }
-    } else {
-      console.log("✅ User found in MongoDB:", existingUser);
-
-      // If email changed, update
-      if (existingUser.email !== email) {
-        console.log(
-          `🔄 Email changed from ${existingUser.email} to ${email}, updating...`
-        );
-        try {
-          const updateRes = await fetch(`${API_BASE_URL}/users/${username}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email }),
-          });
-
-          if (updateRes.ok) {
-            existingUser = (await updateRes.json()) as User;
-            setUsers((prev) =>
-              prev.map((u) => (u.username === username ? existingUser! : u))
-            );
-          }
-        } catch (err) {
-          console.warn("⚠️ Could not update email:", err);
-        }
-      }
-
-      // Optionally update fullName from Cognito if missing
-      if (!existingUser.fullName && fullNameFromCognito) {
-        const nameUpdate: Partial<User> = { fullName: fullNameFromCognito };
-        try {
-          console.log("🔄 Updating fullName from Cognito:", nameUpdate);
-          const updateRes = await fetch(`${API_BASE_URL}/users/${username}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(nameUpdate),
-          });
-
-          if (updateRes.ok) {
-            existingUser = (await updateRes.json()) as User;
-            setUsers((prev) =>
-              prev.map((u) => (u.username === username ? existingUser! : u))
-            );
-          }
-        } catch (err) {
-          console.warn("⚠️ Could not update fullName:", err);
-        }
-      }
-    }
-
-    if (existingUser?.isBanned) {
-      throw new Error("This account has been suspended.");
-    }
-
-    setUser(existingUser || null);
-  };
-
-  // -------------------------
-  // EXPOSED: Sync User (called by Callback page)
+  // EXPOSED: Sync User (AuthCallback calls this)
   // -------------------------
   const syncUserFromCognito = async () => {
     setIsLoading(true);
-    try {
-      console.log("🔄 Syncing user from Cognito...");
+    setError(null);
 
+    try {
       const hasValidSession = await ensureValidSession();
-      if (!hasValidSession) {
-        throw new Error("Could not obtain valid session");
-      }
+      if (!hasValidSession) throw new Error("Could not obtain valid session");
 
       const cognitoUser = await getCurrentUser();
-      const username = cognitoUser.username;
       const session = await fetchAuthSession();
-      const idToken = session.tokens?.idToken?.payload || {};
-      const email = idToken.email as string | undefined;
-      const fullName = idToken.name as string | undefined; // 👈 full name
+      const idTokenPayload = session.tokens?.idToken?.payload || {};
+      const email = idTokenPayload.email as string | undefined;
 
-      if (!username || !email) {
-        throw new Error("Missing username or email from Cognito");
+      if (!email) throw new Error("Missing email from Cognito ID token");
+
+      await performSync(cognitoUser.username, email);
+    } catch (err: any) {
+      // ✅ If banned, make sure error is exactly what Login expects
+      const msg = String(err?.message || "");
+      if (msg.toLowerCase().includes("banned")) {
+        setError("Account is banned");
+        throw new Error("Account is banned");
       }
 
-      console.log("📧 Syncing:", username, email, fullName);
-
-      const res = await fetch(`${API_BASE_URL}/users`);
-      const allUsers: User[] = await res.json();
-      setUsers(allUsers);
-
-      await performSync(username, email, fullName, allUsers);
-      console.log("✅ Sync completed successfully");
-    } catch (err: any) {
       console.error("❌ Sync failed:", err);
-      setError(err.message);
+      setError(msg || "Sync failed");
       throw err;
     } finally {
       setIsLoading(false);
@@ -334,18 +297,17 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
   };
 
   // -------------------------
-  // LOGIN (Manual Fallback)
+  // LOGIN
   // -------------------------
   const login = async (email: string, password: string) => {
     setIsLoading(true);
     setError(null);
+
     try {
       const { isSignedIn } = await signIn({ username: email, password });
-      if (isSignedIn) {
-        await syncUserFromCognito();
-      }
+      if (isSignedIn) await syncUserFromCognito();
     } catch (err: any) {
-      setError(err.message || "Login failed.");
+      setError(err?.message || "Login failed.");
       throw err;
     } finally {
       setIsLoading(false);
@@ -360,34 +322,37 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
       await signOut();
       setUser(null);
       setError(null);
-      console.log("✅ Logged out successfully");
     } catch (err) {
       console.error("❌ Logout error:", err);
     }
   };
 
   // -------------------------
-  // UPDATE LOGGED-IN USER
+  // UPDATE LOGGED-IN USER (DB + local)
+  // ✅ never send role
   // -------------------------
   const updateUser = async (updatedData: Partial<User>) => {
     if (!user) return;
-    try {
-      console.log("🔄 Updating current user:", updatedData);
 
+    const { role, ...safeData } = updatedData as any;
+
+    try {
       const res = await fetch(`${API_BASE_URL}/users/${user.username}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updatedData),
+        body: JSON.stringify(safeData),
       });
 
-      if (!res.ok) throw new Error("Failed to update user.");
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || "Failed to update user.");
+      }
 
       const updatedUser: User = await res.json();
       setUser(updatedUser);
       setUsers((prev) =>
         prev.map((u) => (u.username === user.username ? updatedUser : u))
       );
-      console.log("✅ User updated successfully");
     } catch (e) {
       console.error("❌ Error updating user:", e);
       alert("Error updating user details.");
@@ -396,27 +361,26 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
 
   // -------------------------
   // ADMIN UPDATE ANY USER
+  // ✅ never send role
   // -------------------------
-  const updateUserDetails = async (
-    username: string,
-    updatedData: Partial<User>
-  ) => {
-    try {
-      console.log(`🔄 Updating user ${username}:`, updatedData);
+  const updateUserDetails = async (username: string, updatedData: Partial<User>) => {
+    const { role, ...safeData } = updatedData as any;
 
+    try {
       const res = await fetch(`${API_BASE_URL}/users/${username}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updatedData),
+        body: JSON.stringify(safeData),
       });
 
-      if (!res.ok) throw new Error("Failed to update user.");
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || "Failed to update user.");
+      }
 
       const updatedUser: User = await res.json();
-      setUsers((prev) =>
-        prev.map((u) => (u.username === username ? updatedUser : u))
-      );
-      console.log("✅ User updated successfully");
+      setUsers((prev) => prev.map((u) => (u.username === username ? updatedUser : u)));
+      if (user?.username === username) setUser(updatedUser);
     } catch (e) {
       console.error("❌ Error updating user:", e);
       alert("Error updating user details.");
@@ -434,48 +398,32 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
     if (!recipient) throw new Error("Recipient not found.");
     if (user.balance < amount) throw new Error("Insufficient funds.");
 
-    try {
-      console.log(`💸 Transferring $${amount} to ${recipientEmail}`);
+    const updatedSender: User = { ...user, balance: user.balance - amount };
+    const updatedRecipient: User = { ...recipient, balance: recipient.balance + amount };
 
-      const updatedSender: User = {
-        ...user,
-        balance: user.balance - amount,
-      };
-      const updatedRecipient: User = {
-        ...recipient,
-        balance: recipient.balance + amount,
-      };
+    setUser(updatedSender);
+    setUsers((prev) =>
+      prev.map((u) =>
+        u.username === user.username
+          ? updatedSender
+          : u.username === recipient.username
+          ? updatedRecipient
+          : u
+      )
+    );
 
-      // Optimistic update
-      setUser(updatedSender);
-      setUsers((prev) =>
-        prev.map((u) =>
-          u.username === user.username
-            ? updatedSender
-            : u.username === recipient.username
-            ? updatedRecipient
-            : u
-        )
-      );
-
-      await Promise.all([
-        fetch(`${API_BASE_URL}/users/${user.username}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ balance: updatedSender.balance }),
-        }),
-        fetch(`${API_BASE_URL}/users/${recipient.username}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ balance: updatedRecipient.balance }),
-        }),
-      ]);
-
-      console.log("✅ Transfer completed successfully");
-    } catch (err) {
-      console.error("❌ Transfer failed:", err);
-      throw new Error("Transfer failed. Try again.");
-    }
+    await Promise.all([
+      fetch(`${API_BASE_URL}/users/${user.username}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ balance: updatedSender.balance }),
+      }),
+      fetch(`${API_BASE_URL}/users/${recipient.username}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ balance: updatedRecipient.balance }),
+      }),
+    ]);
   };
 
   return (
@@ -488,6 +436,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({
         login,
         logout,
         syncUserFromCognito,
+        refreshUsers,
+        refreshCurrentUser,
         updateUser,
         updateUserDetails,
         transferFunds,

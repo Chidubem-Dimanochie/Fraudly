@@ -371,7 +371,7 @@ const SettingsTab: React.FC<{
                     <div className="flex-shrink-0">
                         <div className="h-20 w-20 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center text-3xl font-bold">
                             {user.fullName
-                                ? user.username
+                                ? user.fullName
                                       .split(' ')
                                       .filter(Boolean)
                                       .slice(0, 2)
@@ -386,7 +386,6 @@ const SettingsTab: React.FC<{
                             {user.fullName || user.username}
                         </h3>
                         <p className="text-indigo-100 text-sm mt-1">{user.email}</p>
-                        <p className="text-indigo-100 text-xs mt-1">@{user.username}</p>
                     </div>
                 </div>
             </div>

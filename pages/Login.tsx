@@ -1,185 +1,232 @@
-import React, { useState, useEffect } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
-import { signInWithRedirect, signOut } from 'aws-amplify/auth';
+import React, { useEffect, useRef, useState } from "react";
+import { useNavigate, Link, useLocation } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
+import { signInWithRedirect, signOut } from "aws-amplify/auth";
 
 const Shield: React.FC<{ className?: string }> = ({ className }) => (
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
     <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
   </svg>
 );
 
+// ✅ Only keep a persistent lock for banned users
+const AUTH_LOCKED_KEY = "AUTH_LOCKED";
+
+// ✅ "pending login attempt" markers
+const LOGIN_PENDING_KEY = "LOGIN_PENDING";
+const LOGIN_PENDING_AT_KEY = "LOGIN_PENDING_AT";
+
+const LOGIN_WATCHDOG_MS = 9000;
+
 const Login: React.FC = () => {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [localError, setLocalError] = useState<string | null>(null);
+  const [authLocked, setAuthLocked] = useState(false);
 
-  const { login, user, isLoading, error } = useAuth();
+  const { user, isLoading, error: ctxError } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
 
-  // Redirect user ONLY if they are already fully authenticated (e.g. session exists)
-  // We do NOT auto-redirect to Cognito here to prevent infinite loops.
-  useEffect(() => {
-    if (user) {
-      navigate('/dashboard', { replace: true });
-    }
-  }, [user, navigate]);
+  const signedOutOnce = useRef(false);
+  const watchdogTimer = useRef<number | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLocalError(null);
-    if (!email || !password) return;
+  // ✅ Only show ctxError if NOT logged out and NOT something we cleared
+  const displayError = localError || ctxError;
 
-    try {
-      // Local/Mock login fallback
-      await login(email, password);
-    } catch (err: any) {
-      console.error("Login failed:", err);
-      setLocalError(err.message || "Login failed");
+  const clearWatchdog = () => {
+    if (watchdogTimer.current) {
+      window.clearTimeout(watchdogTimer.current);
+      watchdogTimer.current = null;
     }
   };
 
-  const handleSSOLogin = async () => {
-    setLocalError(null);
-    try {
-      // Triggers the AWS Cognito Hosted UI redirect
-      await signInWithRedirect();
-    } catch (err: any) {
-      console.error("Failed to start SSO flow:", err);
-      
-      // Handle case where user is already signed in
-      if (err.name === 'UserAlreadyAuthenticatedException') {
-        // Sign out first, then try again
-        try {
-          await signOut();
-          await signInWithRedirect();
-        } catch (retryErr) {
-          console.error("Retry failed:", retryErr);
-          setLocalError("Please refresh the page and try again.");
-        }
-      } else {
-        setLocalError("Failed to start SSO login. Please try again.");
+  const clearPending = () => {
+    sessionStorage.removeItem(LOGIN_PENDING_KEY);
+    sessionStorage.removeItem(LOGIN_PENDING_AT_KEY);
+  };
+
+  /**
+   * ✅ NEW RULE:
+   * - "Sign in failed" is NOT stored/persisted.
+   * - Only "banned lock" persists.
+   */
+
+  // ✅ On mount: if this is a normal visit to /login, DO NOT show errors by default.
+  useEffect(() => {
+    const loggedOut = (location.state as any)?.loggedOut;
+
+    // If user explicitly logged out, clear everything
+    if (loggedOut) {
+      clearWatchdog();
+      clearPending();
+      sessionStorage.removeItem(AUTH_LOCKED_KEY);
+      setAuthLocked(false);
+      setLocalError(null);
+
+      // clear the location state
+      navigate("/login", { replace: true, state: {} });
+      return;
+    }
+
+    // If locked (banned), show banned message
+    const locked = sessionStorage.getItem(AUTH_LOCKED_KEY) === "1";
+    setAuthLocked(locked);
+
+    if (locked) {
+      setLocalError("Account is banned");
+    } else {
+      // ✅ IMPORTANT: Never keep old "sign in failed" hanging around
+      setLocalError(null);
+      // also clear any stale pending markers from older sessions
+      clearPending();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ✅ If we reach dashboard conditions, clear pending + errors and navigate
+  useEffect(() => {
+    if (!authLocked && user && !user.isBanned) {
+      clearWatchdog();
+      clearPending();
+      setLocalError(null);
+      navigate("/dashboard", { replace: true });
+    }
+  }, [user, authLocked, navigate]);
+
+  // ✅ If banned ever shows up in state, lock + show message + sign out once
+  useEffect(() => {
+    if (user?.isBanned) {
+      setAuthLocked(true);
+      sessionStorage.setItem(AUTH_LOCKED_KEY, "1");
+      setLocalError("Account is banned");
+
+      clearWatchdog();
+      clearPending();
+
+      if (!signedOutOnce.current) {
+        signedOutOnce.current = true;
+        signOut({ global: true }).catch(() => {});
       }
     }
+  }, [user]);
+
+  /**
+   * ✅ Watchdog:
+   * Only shows "Sign in failed" if the user *started* login (pending=1)
+   * and we still ended up stuck on /login after the timeout.
+   */
+  useEffect(() => {
+    clearWatchdog();
+
+    // never show sign-in failed if banned locked
+    if (authLocked) return;
+
+    const pending = sessionStorage.getItem(LOGIN_PENDING_KEY) === "1";
+    const pendingAt = Number(sessionStorage.getItem(LOGIN_PENDING_AT_KEY) || "0");
+    if (!pending) return;
+
+    const elapsed = pendingAt ? Date.now() - pendingAt : 0;
+    const remaining = Math.max(0, LOGIN_WATCHDOG_MS - elapsed);
+
+    if (location.pathname !== "/login") return;
+
+    watchdogTimer.current = window.setTimeout(() => {
+      const stillPending = sessionStorage.getItem(LOGIN_PENDING_KEY) === "1";
+      if (!stillPending) return;
+
+      // ✅ Show error once, but do NOT persist it
+      clearPending();
+      setLocalError("Sign in failed. Please try again.");
+    }, remaining);
+
+    return () => clearWatchdog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname, authLocked]);
+
+  const handleSSOLogin = async () => {
+    // user is explicitly trying again
+    setLocalError(null);
+    setAuthLocked(false);
+    sessionStorage.removeItem(AUTH_LOCKED_KEY);
+
+    // mark pending attempt
+    sessionStorage.setItem(LOGIN_PENDING_KEY, "1");
+    sessionStorage.setItem(LOGIN_PENDING_AT_KEY, String(Date.now()));
+
+    clearWatchdog();
+    watchdogTimer.current = window.setTimeout(() => {
+      const stillPending = sessionStorage.getItem(LOGIN_PENDING_KEY) === "1";
+      const locked = sessionStorage.getItem(AUTH_LOCKED_KEY) === "1";
+      if (stillPending && !locked) {
+        clearPending();
+        setLocalError("Sign in failed. Please click “Sign in with Cognito” again.");
+      }
+    }, LOGIN_WATCHDOG_MS);
+
+    try {
+      // avoid stuck sessions
+      await signOut({ global: true }).catch(() => {});
+      await signInWithRedirect();
+    } catch (err: any) {
+      console.error("SSO login failed:", err);
+      clearWatchdog();
+      clearPending();
+      setLocalError("Failed to start login. Please try again.");
+    }
   };
 
-  const displayError = localError || error;
-
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 px-4 sm:px-6 lg:px-8 relative">
-      
-      {/* Back to Home Link - Top Shield Icon */}
-      <div className="mb-8 relative z-10">
-        <Link to="/" className="flex items-center gap-2 group p-2 rounded-lg hover:bg-gray-100 transition-colors">
-           <Shield className="w-10 h-10 text-blue-600" />
-           <span className="text-2xl font-bold text-gray-900 group-hover:text-blue-600 transition-colors">Fraudly</span>
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 px-4 relative">
+      <div className="mb-8">
+        <Link to="/" className="flex items-center gap-2 p-2 rounded-lg hover:bg-gray-100">
+          <Shield className="w-10 h-10 text-blue-600" />
+          <span className="text-2xl font-bold text-gray-900">Fraudly</span>
         </Link>
       </div>
 
-      <div className="max-w-md w-full bg-white p-10 rounded-xl shadow-lg relative z-10"> 
-        <div>
-          <h2 className="mt-2 text-center text-3xl font-extrabold text-gray-900">
-            Sign in to your account
-          </h2>
-          <p className="mt-2 text-center text-sm text-gray-600">
-            Select your preferred login method
-          </p>
+      <div className="max-w-md w-full bg-white p-10 rounded-xl shadow-lg">
+        <h2 className="text-center text-3xl font-extrabold text-gray-900">Sign in to your account</h2>
+        <p className="mt-2 text-center text-sm text-gray-600">Secure login via Cognito</p>
+
+        <div className="mt-8">
+          <button
+            onClick={handleSSOLogin}
+            disabled={isLoading || authLocked}
+            className="w-full flex justify-center py-3 px-4 rounded-md shadow-sm
+                       text-sm font-bold text-white bg-blue-600 hover:bg-blue-700
+                       focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500
+                       disabled:opacity-60"
+          >
+            {authLocked ? "Account Banned" : isLoading ? "Signing in..." : "Sign in with Cognito"}
+          </button>
         </div>
 
-        <div className="mt-8 space-y-6">
-          
-          {/* PRIMARY METHOD: Cognito SSO */}
-          <div>
-            <button
-              onClick={handleSSOLogin}
-              type="button"
-              className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
-            >
-              Sign in with Cognito
-            </button>
-            <p className="text-xs text-center text-gray-400 mt-2">
-              
+        {displayError && (
+          <div className="rounded-md bg-red-50 p-4 mt-4">
+            <p className="text-sm text-red-800">
+              {String(displayError).toLowerCase().includes("banned") ||
+              String(displayError).toLowerCase().includes("suspended")
+                ? "Account is banned. Please contact support."
+                : displayError}
             </p>
           </div>
+        )}
 
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-gray-300" />
-            </div>
-            <div className="relative flex justify-center text-sm">
-            {/* <span className="px-2 bg-white text-gray-500">Or use legacy credentials</span> */}
-            </div>
-          </div>
-
-          {/* SECONDARY METHOD: Username/Password Form
-          <form className="space-y-6" onSubmit={handleSubmit}>
-            <div className="rounded-md shadow-sm -space-y-px">
-              <div>
-                <label htmlFor="email-address" className="sr-only">Email address</label>
-                <input
-                  id="email-address"
-                  name="email"
-                  type="email"
-                  autoComplete="email"
-                  required
-                  className="appearance-none rounded-none relative block w-full px-3 py-2 border 
-                             border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md 
-                             focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 
-                             focus:z-10 sm:text-sm"
-                  placeholder="Email address"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <label htmlFor="password" className="sr-only">Password</label>
-                <input
-                  id="password"
-                  name="password"
-                  type="password"
-                  autoComplete="current-password"
-                  required
-                  className="appearance-none rounded-none relative block w-full px-3 py-2 border 
-                             border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md 
-                             focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 
-                             focus:z-10 sm:text-sm"
-                  placeholder="Password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-            </div>
-
-            {displayError && (
-              <div className="rounded-md bg-red-50 p-4">
-                <p className="text-sm text-red-800">{displayError}</p>
-              </div>
-            )}
-
-            <div>
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="group relative w-full flex justify-center py-2 px-4 border border-gray-300 
-                           text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 
-                           focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 
-                           disabled:bg-gray-100 disabled:cursor-not-allowed"
-              >
-                {isLoading ? 'Signing in...' : 'Sign in with Password'} */}
-              {/* </button> */}
-            </div>
-          {/* </form> */}
-        </div>
-
-        {/* Back to Home Link - Bottom Text */}
         <div className="text-center mt-6">
-            <Link to="/" className="text-sm text-indigo-600 hover:text-indigo-500 font-medium">
-                &larr; Back to Home
-            </Link>
+          <Link to="/" className="text-sm text-indigo-600 hover:text-indigo-500 font-medium">
+            ← Back to Home
+          </Link>
         </div>
       </div>
-    //</div>
+    </div>
   );
 };
 

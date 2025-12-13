@@ -38,6 +38,9 @@ export interface Transaction {
   reason: string;
   timestamp: string;
   analystNotes?: AnalystNote[];
+
+  // 🔥 NEW: probability from the ML model (0–1). e.g. 0.87 = 87% fraud risk
+  modelScore?: number;
 }
 
 // Represents an entry in the audit log for admin/employee actions.
