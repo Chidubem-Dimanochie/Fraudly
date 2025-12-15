@@ -6,7 +6,7 @@ import EmployeeDashboard from './EmployeeDashboard';
 import CustomerDashboard from './CustomerDashboard';
 import { useNavigate } from 'react-router-dom';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || // "http://localhost:8000/api";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || /* "http://localhost:8000/api"*/;
 
 const Dashboard: React.FC = () => {
   const { user, users, updateUser, updateUserDetails, transferFunds, logout } = useAuth();
