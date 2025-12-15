@@ -1,5 +1,10 @@
 import { Amplify } from "aws-amplify";
 
+const origin = window.location.origin;
+
+const redirectSignIn = `${origin}/auth/callback`;
+const redirectSignOut = `${origin}/login`;
+
 Amplify.configure({
   Auth: {
     Cognito: {
@@ -8,15 +13,9 @@ Amplify.configure({
       loginWith: {
         oauth: {
           domain: "fraudly.auth.us-east-1.amazoncognito.com",
-          scopes: ["openid", "email", "profile"],
-          redirectSignIn: [
-            "http://localhost:3000/auth/callback",
-            "https://fraudly-1.onrender.com/auth/callback"
-          ],
-          redirectSignOut: [
-            "http://localhost:3000/login",
-            "https://fraudly-1.onrender.com/login"
-          ],
+          scopes: ["openid", "email", "profile"], 
+          redirectSignIn: [redirectSignIn],
+          redirectSignOut: [redirectSignOut],
           responseType: "code",
         },
       },
