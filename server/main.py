@@ -9,7 +9,7 @@ from datetime import datetime
 from uuid import uuid4
 import os
 
-# ✅ Added for migration endpoint ONLY (not used in normal requests)
+# Added for migration endpoint ONLY (not used in normal requests)
 import boto3
 from botocore.exceptions import ClientError
 
@@ -20,9 +20,9 @@ try:
     import joblib
     import pandas as pd
     ML_DEPS_AVAILABLE = True
-    print("✅ ML dependencies available.")
+    print("ML dependencies available.")
 except Exception as e:
-    print("⚠️ ML dependencies not available:", e)
+    print("ML dependencies not available:", e)
     joblib = None
     pd = None
     ML_DEPS_AVAILABLE = False
@@ -34,13 +34,13 @@ app = FastAPI()
 # ----------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    print(f"❌ Validation Error at {request.url}")
+    print(f"Validation Error at {request.url}")
     body = await request.body()
     try:
-        print(f"❌ Request body: {body.decode('utf-8')}")
+        print(f"Request body: {body.decode('utf-8')}")
     except Exception:
-        print("❌ Request body: <binary>")
-    print(f"❌ Errors: {exc.errors()}")
+        print("Request body: <binary>")
+    print(f" Errors: {exc.errors()}")
 
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -111,7 +111,7 @@ class Transaction(BaseModel):
     # Legacy/alias:
     mlProbability: Optional[float] = None
 
-    # ✅ prevents double-charging:
+    # prevents double-charging:
     fundsApplied: bool = False
 
 
@@ -194,17 +194,54 @@ if ML_DEPS_AVAILABLE:
 
         fraud_pipeline = joblib.load(pipeline_path)
         ML_MODEL_READY = True
-        print(f"✅ Loaded fraud pipeline from: {pipeline_path}")
+        print(f" Loaded fraud pipeline from: {pipeline_path}")
+
+        # Helpful one-time debug so you can see what class order your model uses
+        try:
+            classes = getattr(fraud_pipeline, "classes_", None)
+            if classes is None and hasattr(fraud_pipeline, "named_steps"):
+                clf = fraud_pipeline.named_steps.get("clf")
+                classes = getattr(clf, "classes_", None)
+            print(" Model classes_:", classes)
+        except Exception as e:
+            print(" Could not read model classes_:", e)
+
     except Exception as e:
         ML_MODEL_READY = False
         fraud_pipeline = None
-        print("⚠️ Failed to load fraud_pipeline.joblib:", e)
+        print("Failed to load fraud_pipeline.joblib:", e)
 
 
 def _iso_to_hour(iso_ts: str) -> int:
     clean = iso_ts.replace("Z", "")
     dt = datetime.fromisoformat(clean)
     return dt.hour
+
+
+def _get_fraud_probability_from_proba(model: Any, proba_row: Any) -> Optional[float]:
+    """
+    Given a model and a single predict_proba row, return the probability for class 1 (fraud).
+    This avoids assuming the fraud probability is always column [1].
+    """
+    classes = getattr(model, "classes_", None)
+
+    # If this is a Pipeline, classes_ might live on the final estimator
+    if classes is None and hasattr(model, "named_steps"):
+        clf = model.named_steps.get("clf")
+        classes = getattr(clf, "classes_", None)
+
+    if classes is None:
+        return None
+
+    classes_list = list(classes)
+    if 1 not in classes_list:
+        return None
+
+    fraud_idx = classes_list.index(1)
+    try:
+        return float(proba_row[fraud_idx])
+    except Exception:
+        return None
 
 
 def ml_predict_fraud_probability(amount: float, iso_timestamp: Optional[str]) -> Optional[float]:
@@ -218,11 +255,14 @@ def ml_predict_fraud_probability(amount: float, iso_timestamp: Optional[str]) ->
     try:
         ts = iso_timestamp or datetime.utcnow().isoformat()
         hour = _iso_to_hour(ts)
+
         X = pd.DataFrame([{"Amount": float(amount), "Hour": int(hour)}])
-        prob = float(fraud_pipeline.predict_proba(X)[0][1])
+
+        proba_row = fraud_pipeline.predict_proba(X)[0]
+        prob = _get_fraud_probability_from_proba(fraud_pipeline, proba_row)
         return prob
     except Exception as e:
-        print("⚠️ ML prediction failed:", e)
+        print("ML prediction failed:", e)
         return None
 
 
@@ -241,7 +281,7 @@ def _ensure_model_fields(txn: dict) -> dict:
 
 def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) -> tuple[str, str, Optional[float]]:
     """
-    ✅ Thresholds:
+     Thresholds:
       score >= 0.70  -> fraudulent
       0.50–0.69      -> in_review
       < 0.50         -> approved
@@ -254,7 +294,7 @@ def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) 
     # 1) ML decision (your thresholds)
     ml_prob = ml_predict_fraud_probability(amount, iso_timestamp)
     if ml_prob is not None:
-        if ml_prob >= 0.70:
+        if ml_prob >= 0.73:
             status_out = "fraudulent"
             reason = f"High ML risk ({ml_prob:.2f})."
         elif ml_prob >= 0.50:
@@ -272,7 +312,7 @@ def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) 
     try:
         rules = list(fraud_rules_collection.find({}, {"_id": 0}))
     except Exception as e:
-        print("⚠️ Could not load fraud rules:", e)
+        print("Could not load fraud rules:", e)
         rules = []
 
     for rule in rules:
@@ -324,7 +364,7 @@ def _apply_funds_once(txn: dict) -> None:
 
 
 # ==========================================================
-# ✅ ONE-TIME MIGRATION ENDPOINT: username + fullName from Cognito
+# ONE-TIME MIGRATION ENDPOINT: username + fullName from Cognito
 # (Normal endpoints do NOT call Cognito)
 # ==========================================================
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -348,7 +388,7 @@ def _get_cognito_user_by_email(email: str) -> Optional[dict]:
         users = resp.get("Users", [])
         return users[0] if users else None
     except Exception as e:
-        print(f"  ⚠ Could not fetch from Cognito for {email}: {e}")
+        print(f"  Could not fetch from Cognito for {email}: {e}")
         return None
 
 
@@ -463,7 +503,6 @@ async def migrate_usernames_and_names(request: Request):
 # ----------------------------
 # USERS endpoints (Mongo-only)
 # ----------------------------
-
 @app.get("/api/users")
 async def get_users():
     try:
@@ -612,7 +651,7 @@ async def get_transaction(transaction_id: str):
 @app.post("/api/transactions")
 async def create_transaction(transaction: TransactionCreate):
     """
-    ✅ Money rule:
+     Money rule:
       - We only change the user's balance when the transaction is APPROVED.
       - If status is in_review or fraudulent, balance doesn't change.
     """
@@ -664,7 +703,7 @@ async def create_transaction(transaction: TransactionCreate):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error creating transaction: {str(e)}")
+        print(f" Error creating transaction: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
@@ -673,10 +712,10 @@ from fastapi import HTTPException, status
 @app.put("/api/transactions/{transaction_id}")
 async def update_transaction(transaction_id: str, updated_data: dict):
     """
-    ✅ Finality Rule:
+     Finality Rule:
       - ONLY transactions currently "in_review" can be updated.
       - If current is "approved" or "fraudulent" => FINAL (cannot be changed).
-    ✅ Money Rule:
+     Money Rule:
       - If status changes TO approved, deduct funds once.
       - No refunds (since approved->fraudulent is now impossible).
     """
@@ -687,17 +726,17 @@ async def update_transaction(transaction_id: str, updated_data: dict):
 
         old_status = txn.get("status")
 
-        # ✅ BLOCK updates unless current status is in_review
+        # BLOCK updates unless current status is in_review
         if old_status != "in_review":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Transaction is final ({old_status}). Only in_review transactions can be updated."
             )
 
-        # ✅ Determine requested new status (if any)
+        #  Determine requested new status (if any)
         new_status = updated_data.get("status", old_status)
 
-        # ✅ Optional: restrict allowed transitions out of in_review
+        # Optional: restrict allowed transitions out of in_review
         allowed_next = {"approved", "fraudulent"}
         if new_status != old_status and new_status not in allowed_next:
             raise HTTPException(
@@ -705,10 +744,10 @@ async def update_transaction(transaction_id: str, updated_data: dict):
                 detail="Invalid status transition. in_review can only become approved or fraudulent."
             )
 
-        # ✅ Apply updates
+        # Apply updates
         transactions_collection.update_one({"id": transaction_id}, {"$set": updated_data})
 
-        # ✅ If moved to approved, apply funds once
+        # If moved to approved, apply funds once
         if new_status == "approved":
             refreshed = transactions_collection.find_one({"id": transaction_id})
             if refreshed and not refreshed.get("fundsApplied", False):
@@ -724,6 +763,7 @@ async def update_transaction(transaction_id: str, updated_data: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
 # ----------------------------
 # AUDIT LOGS endpoints
 # ----------------------------
@@ -873,9 +913,9 @@ async def startup_event():
     print(f"Database: {db.name}")
     try:
         db.command("ping")
-        print("✅ MongoDB connection successful")
+        print(" MongoDB connection successful")
         collections = db.list_collection_names()
-        print(f"✅ Collections: {collections}")
+        print(f" Collections: {collections}")
     except Exception as e:
-        print(f"❌ MongoDB connection failed: {e}")
+        print(f" MongoDB connection failed: {e}")
     print("=" * 50)

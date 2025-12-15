@@ -76,12 +76,17 @@ const Dashboard: React.FC = () => {
 
   // ✅ UPDATED: logout redirects to /login with a "loggedOut" flag
   const handleLogout = async () => {
-    try {
-      await logout();
-    } finally {
-      navigate('/login', { replace: true, state: { loggedOut: true } });
-    }
+    // ✅ clear sticky login flags so errors don't persist after a clean logout
+    sessionStorage.removeItem("LOGIN_ERROR");
+    sessionStorage.removeItem("LOGIN_PENDING");
+    sessionStorage.removeItem("LOGIN_PENDING_AT");
+    sessionStorage.removeItem("AUTH_LOCKED");
+    sessionStorage.removeItem("BANNED_LOOP_ONCE");
+  
+    await logout();
+    navigate("/", { replace: true });
   };
+  
 
   const addAuditLog = async (action: string, details: string) => {
     const newLog = {
