@@ -6,7 +6,7 @@ import EmployeeDashboard from './EmployeeDashboard';
 import CustomerDashboard from './CustomerDashboard';
 import { useNavigate } from 'react-router-dom';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
 
 const Dashboard: React.FC = () => {
   const { user, users, updateUser, updateUserDetails, transferFunds, logout } = useAuth();
@@ -18,7 +18,7 @@ const Dashboard: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
-  // ✅ Helper: refresh current user from backend (to update balance after approval)
+  // Helper: refresh current user from backend (to update balance after approval)
   const refreshCurrentUser = async () => {
     if (!user?.email) return;
     try {
@@ -42,7 +42,7 @@ const Dashboard: React.FC = () => {
         ]);
 
         if (!txnsRes.ok || !logsRes.ok) {
-          console.error('❌ Failed to fetch:', {
+          console.error('Failed to fetch:', {
             transactions: txnsRes.status,
             logs: logsRes.status,
           });
@@ -96,7 +96,7 @@ const Dashboard: React.FC = () => {
       details,
     };
 
-    console.log('📝 Adding audit log:', newLog);
+    console.log('Adding audit log:', newLog);
 
     try {
       const response = await fetch(`${API_BASE}/audit-logs`, {
@@ -170,7 +170,7 @@ const Dashboard: React.FC = () => {
       setTransactions(prev => [savedTransaction, ...prev]);
       setLastTransaction(savedTransaction);
     } catch (err) {
-      console.error('❌ Failed to create transaction:', err);
+      console.error('Failed to create transaction:', err);
       setError('Failed to process transaction. Please try again.');
     } finally {
       setIsLoading(false);
@@ -220,7 +220,7 @@ const Dashboard: React.FC = () => {
         await refreshCurrentUser();
       }
     } catch (err) {
-      console.error('❌ Failed to update transaction:', err);
+      console.error('Failed to update transaction:', err);
       setTransactions(originalTransactions);
       alert('Error: Could not update transaction status.');
     }
