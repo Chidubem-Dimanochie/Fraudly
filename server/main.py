@@ -9,9 +9,19 @@ from datetime import datetime
 from uuid import uuid4
 import os
 
-# Added for migration endpoint ONLY (not used in normal requests)
-import boto3
-from botocore.exceptions import ClientError
+# ----------------------------
+# Optional AWS imports (boto3) - DO NOT CRASH if missing
+# ----------------------------
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    AWS_DEPS_AVAILABLE = True
+    print("AWS dependencies available (boto3).")
+except Exception as e:
+    boto3 = None
+    ClientError = None
+    AWS_DEPS_AVAILABLE = False
+    print("AWS dependencies not available:", e)
 
 # ----------------------------
 # Optional ML imports (safe)
@@ -20,7 +30,7 @@ try:
     import joblib
     import pandas as pd
     ML_DEPS_AVAILABLE = True
-    print("ML dependencies available.")
+    print("ML dependencies available (joblib/pandas).")
 except Exception as e:
     print("ML dependencies not available:", e)
     joblib = None
@@ -55,8 +65,8 @@ origins = [
     "http://10.88.7.176:3000",
     "https://main.d3sba06ap3p2l2.amplifyapp.com",
     "https://fraudly-git-main-chidubem-dimanochies-projects.vercel.app",
-    "https://fraudly-1.onrender.com"
-    
+    "https://fraudly-1.onrender.com",
+    "https://fraudly.onrender.com",
 ]
 
 app.add_middleware(
@@ -107,13 +117,8 @@ class Transaction(BaseModel):
     reason: str
     timestamp: str
     analystNotes: Optional[List[AnalystNote]] = None
-
-    # Frontend expects this:
     modelScore: Optional[float] = None
-    # Legacy/alias:
     mlProbability: Optional[float] = None
-
-    # prevents double-charging:
     fundsApplied: bool = False
 
 
@@ -180,54 +185,65 @@ rules_collection = fraud_rules_collection
 def generate_id() -> str:
     return str(uuid4())
 
-
 # ----------------------------
 # ML: load joblib pipeline
-# Required file: ./models/fraud_pipeline.joblib
 # ----------------------------
 ML_MODEL_READY = False
 fraud_pipeline = None
+ML_LOAD_ERROR = None
 
-if ML_DEPS_AVAILABLE:
+def _resolve_model_path() -> str:
+    """
+    Priority:
+    1) env ML_MODEL_PATH
+    2) ./models/fraud_pipeline.joblib next to this file
+    """
+    env_path = os.getenv("ML_MODEL_PATH")
+    if env_path:
+        return env_path
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "models", "fraud_pipeline.joblib")
+
+def _try_load_model():
+    global ML_MODEL_READY, fraud_pipeline, ML_LOAD_ERROR
+    if not ML_DEPS_AVAILABLE:
+        ML_MODEL_READY = False
+        ML_LOAD_ERROR = "ML deps missing (joblib/pandas not installed)"
+        return
+
+    path = _resolve_model_path()
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        models_dir = os.path.join(base_dir, "models")
-        pipeline_path = os.path.join(models_dir, "fraud_pipeline.joblib")
-
-        fraud_pipeline = joblib.load(pipeline_path)
+        fraud_pipeline = joblib.load(path)
         ML_MODEL_READY = True
-        print(f" Loaded fraud pipeline from: {pipeline_path}")
+        ML_LOAD_ERROR = None
+        print(f"Loaded fraud pipeline from: {path}")
 
-        # Helpful one-time debug so you can see what class order your model uses
+        # Debug class order
         try:
             classes = getattr(fraud_pipeline, "classes_", None)
             if classes is None and hasattr(fraud_pipeline, "named_steps"):
                 clf = fraud_pipeline.named_steps.get("clf")
                 classes = getattr(clf, "classes_", None)
-            print(" Model classes_:", classes)
+            print("Model classes_:", classes)
         except Exception as e:
-            print(" Could not read model classes_:", e)
+            print("Could not read model classes_:", e)
 
     except Exception as e:
         ML_MODEL_READY = False
         fraud_pipeline = None
-        print("Failed to load fraud_pipeline.joblib:", e)
+        ML_LOAD_ERROR = f"{type(e).__name__}: {e}"
+        print(f"Failed to load fraud_pipeline.joblib from {path}: {e}")
 
+_try_load_model()
 
 def _iso_to_hour(iso_ts: str) -> int:
     clean = iso_ts.replace("Z", "")
     dt = datetime.fromisoformat(clean)
     return dt.hour
 
-
 def _get_fraud_probability_from_proba(model: Any, proba_row: Any) -> Optional[float]:
-    """
-    Given a model and a single predict_proba row, return the probability for class 1 (fraud).
-    This avoids assuming the fraud probability is always column [1].
-    """
     classes = getattr(model, "classes_", None)
-
-    # If this is a Pipeline, classes_ might live on the final estimator
     if classes is None and hasattr(model, "named_steps"):
         clf = model.named_steps.get("clf")
         classes = getattr(clf, "classes_", None)
@@ -245,19 +261,13 @@ def _get_fraud_probability_from_proba(model: Any, proba_row: Any) -> Optional[fl
     except Exception:
         return None
 
-
 def ml_predict_fraud_probability(amount: float, iso_timestamp: Optional[str]) -> Optional[float]:
-    """
-    Uses your trained pipeline.
-    Assumes training features are: Amount + Hour.
-    """
     if not ML_MODEL_READY or fraud_pipeline is None or pd is None:
         return None
 
     try:
         ts = iso_timestamp or datetime.utcnow().isoformat()
         hour = _iso_to_hour(ts)
-
         X = pd.DataFrame([{"Amount": float(amount), "Hour": int(hour)}])
 
         proba_row = fraud_pipeline.predict_proba(X)[0]
@@ -267,33 +277,18 @@ def ml_predict_fraud_probability(amount: float, iso_timestamp: Optional[str]) ->
         print("ML prediction failed:", e)
         return None
 
-
 def _ensure_model_fields(txn: dict) -> dict:
-    """
-    Ensure BOTH keys exist for frontend compatibility:
-    - modelScore (frontend reads this)
-    - mlProbability (alias)
-    """
     if txn.get("modelScore") is None and txn.get("mlProbability") is not None:
         txn["modelScore"] = txn["mlProbability"]
     if txn.get("mlProbability") is None and txn.get("modelScore") is not None:
         txn["mlProbability"] = txn["modelScore"]
     return txn
 
-
 def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) -> tuple[str, str, Optional[float]]:
-    """
-     Thresholds:
-      score >= 0.70  -> fraudulent
-      0.50–0.69      -> in_review
-      < 0.50         -> approved
-    Then fraud rules may escalate severity.
-    """
     status_out: Literal["approved", "fraudulent", "in_review"] = "approved"
     reason = "Transaction appears normal."
     ml_prob: Optional[float] = None
 
-    # 1) ML decision (your thresholds)
     ml_prob = ml_predict_fraud_probability(amount, iso_timestamp)
     if ml_prob is not None:
         if ml_prob >= 0.73:
@@ -309,7 +304,7 @@ def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) 
         status_out = "approved"
         reason = "ML unavailable."
 
-    # 2) Rule-based overrides (only escalate)
+    # Rule-based overrides (only escalate)
     severity = {"approved": 0, "in_review": 1, "fraudulent": 2}
     try:
         rules = list(fraud_rules_collection.find({}, {"_id": 0}))
@@ -336,12 +331,7 @@ def decide_transaction_status(amount: float, merchant: str, iso_timestamp: str) 
 
     return status_out, reason, ml_prob
 
-
 def _apply_funds_once(txn: dict) -> None:
-    """
-    Deduct balance exactly once when a transaction becomes approved.
-    Uses txn['fundsApplied'] guard.
-    """
     if txn.get("fundsApplied", False):
         return
 
@@ -364,23 +354,27 @@ def _apply_funds_once(txn: dict) -> None:
     users_collection.update_one({"email": user_email}, {"$inc": {"balance": -amount}})
     transactions_collection.update_one({"id": txn["id"]}, {"$set": {"fundsApplied": True}})
 
-
 # ==========================================================
 # ONE-TIME MIGRATION ENDPOINT: username + fullName from Cognito
-# (Normal endpoints do NOT call Cognito)
 # ==========================================================
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID", "us-east-1_HgEmPHJj8")
 MIGRATION_KEY = os.getenv("MIGRATION_KEY", "")
 
-cognito_client = boto3.client("cognito-idp", region_name=AWS_REGION)
-
+cognito_client = None
+if AWS_DEPS_AVAILABLE and boto3 is not None:
+    try:
+        cognito_client = boto3.client("cognito-idp", region_name=AWS_REGION)
+    except Exception as e:
+        print("Could not initialize Cognito client:", e)
+        cognito_client = None
 
 def _generate_username_from_email(email: str) -> str:
     return email.split("@")[0].lower().replace(".", "").replace("-", "")
 
-
 def _get_cognito_user_by_email(email: str) -> Optional[dict]:
+    if cognito_client is None:
+        return None
     try:
         resp = cognito_client.list_users(
             UserPoolId=COGNITO_USER_POOL_ID,
@@ -392,7 +386,6 @@ def _get_cognito_user_by_email(email: str) -> Optional[dict]:
     except Exception as e:
         print(f"  Could not fetch from Cognito for {email}: {e}")
         return None
-
 
 def _extract_username_and_fullname(cognito_user: dict, email: str) -> tuple[str, Optional[str]]:
     username = None
@@ -409,7 +402,6 @@ def _extract_username_and_fullname(cognito_user: dict, email: str) -> tuple[str,
 
     return username, full_name
 
-
 def _resolve_username_conflict(username: str, email: str) -> str:
     conflict = users_collection.find_one({"username": username, "email": {"$ne": email}})
     if not conflict:
@@ -421,17 +413,8 @@ def _resolve_username_conflict(username: str, email: str) -> str:
         counter += 1
     return f"{base}{counter}"
 
-
 @app.post("/api/admin/migrate-usernames-and-names")
 async def migrate_usernames_and_names(request: Request):
-    """
-    Runs a one-time migration:
-      - For users missing username and/or fullName:
-          username <- preferred_username OR Cognito Username OR email-derived
-          fullName <- Cognito attribute "name"
-      - Writes into MongoDB.
-    Locked with header: x-migration-key
-    """
     provided_key = request.headers.get("x-migration-key", "")
     if not MIGRATION_KEY or provided_key != MIGRATION_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -452,7 +435,6 @@ async def migrate_usernames_and_names(request: Request):
         existing_username = user.get("username")
         existing_fullname = user.get("fullName")
 
-        # if both exist, skip
         if existing_username and existing_fullname:
             skipped += 1
             details.append({"email": email, "status": "skipped", "reason": "already has username+fullName"})
@@ -501,7 +483,6 @@ async def migrate_usernames_and_names(request: Request):
         "details": details,
     }
 
-
 # ----------------------------
 # USERS endpoints (Mongo-only)
 # ----------------------------
@@ -511,7 +492,6 @@ async def get_users():
         return list(users_collection.find({}, {"_id": 0}))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 @app.get("/api/users/by-email/{email}")
 async def get_user_by_email(email: str):
@@ -525,11 +505,9 @@ async def get_user_by_email(email: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.get("/api/users/email/{email}")
 async def get_user_by_email_old(email: str):
     return await get_user_by_email(email)
-
 
 @app.get("/api/users/{username}")
 async def get_user(username: str):
@@ -543,11 +521,9 @@ async def get_user(username: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.get("/api/users/username/{username}")
 async def get_user_by_username_old(username: str):
     return await get_user(username)
-
 
 @app.post("/api/users")
 async def create_user(user: User):
@@ -563,7 +539,6 @@ async def create_user(user: User):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 @app.put("/api/users/{username}")
 async def update_user(username: str, updated_data: UserUpdate):
@@ -589,7 +564,6 @@ async def update_user(username: str, updated_data: UserUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.put("/api/users/email/{email}")
 async def update_user_by_email(email: str, updated_data: dict):
     try:
@@ -598,13 +572,12 @@ async def update_user_by_email(email: str, updated_data: dict):
             raise HTTPException(status_code=404, detail="User not found")
 
         username = user["username"]
-        filtered = {k: v for k, v in updated_data.items() if k in UserUpdate.__fields__}
+        filtered = {k: v for k, v in updated_data.items() if k in UserUpdate.model_fields}
         return await update_user(username, UserUpdate(**filtered))
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 @app.delete("/api/users/{username}")
 async def delete_user(username: str):
@@ -617,7 +590,6 @@ async def delete_user(username: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 # ----------------------------
 # TRANSACTIONS endpoints
@@ -636,7 +608,6 @@ async def get_transactions(user_email: Optional[str] = None, status_filter: Opti
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.get("/api/transactions/{transaction_id}")
 async def get_transaction(transaction_id: str):
     try:
@@ -649,14 +620,8 @@ async def get_transaction(transaction_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/api/transactions")
 async def create_transaction(transaction: TransactionCreate):
-    """
-     Money rule:
-      - We only change the user's balance when the transaction is APPROVED.
-      - If status is in_review or fraudulent, balance doesn't change.
-    """
     try:
         user_doc = users_collection.find_one({"email": transaction.userEmail})
         if not user_doc:
@@ -705,22 +670,11 @@ async def create_transaction(transaction: TransactionCreate):
     except HTTPException:
         raise
     except Exception as e:
-        print(f" Error creating transaction: {str(e)}")
+        print(f"Error creating transaction: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-from fastapi import HTTPException, status
 
 @app.put("/api/transactions/{transaction_id}")
 async def update_transaction(transaction_id: str, updated_data: dict):
-    """
-     Finality Rule:
-      - ONLY transactions currently "in_review" can be updated.
-      - If current is "approved" or "fraudulent" => FINAL (cannot be changed).
-     Money Rule:
-      - If status changes TO approved, deduct funds once.
-      - No refunds (since approved->fraudulent is now impossible).
-    """
     try:
         txn = transactions_collection.find_one({"id": transaction_id})
         if not txn:
@@ -728,17 +682,13 @@ async def update_transaction(transaction_id: str, updated_data: dict):
 
         old_status = txn.get("status")
 
-        # BLOCK updates unless current status is in_review
         if old_status != "in_review":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Transaction is final ({old_status}). Only in_review transactions can be updated."
             )
 
-        #  Determine requested new status (if any)
         new_status = updated_data.get("status", old_status)
-
-        # Optional: restrict allowed transitions out of in_review
         allowed_next = {"approved", "fraudulent"}
         if new_status != old_status and new_status not in allowed_next:
             raise HTTPException(
@@ -746,10 +696,8 @@ async def update_transaction(transaction_id: str, updated_data: dict):
                 detail="Invalid status transition. in_review can only become approved or fraudulent."
             )
 
-        # Apply updates
         transactions_collection.update_one({"id": transaction_id}, {"$set": updated_data})
 
-        # If moved to approved, apply funds once
         if new_status == "approved":
             refreshed = transactions_collection.find_one({"id": transaction_id})
             if refreshed and not refreshed.get("fundsApplied", False):
@@ -782,11 +730,9 @@ async def get_audit_logs(actor: Optional[str] = None, action: Optional[str] = No
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.get("/api/logs")
 async def get_logs_old():
     return await get_audit_logs()
-
 
 @app.post("/api/audit-logs")
 async def create_audit_log(log: dict):
@@ -802,11 +748,9 @@ async def create_audit_log(log: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/api/logs")
 async def create_log_old(log: dict):
     return await create_audit_log(log)
-
 
 # ----------------------------
 # FRAUD RULES endpoints
@@ -818,11 +762,9 @@ async def get_fraud_rules():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.get("/api/rules")
 async def get_rules_old():
     return await get_fraud_rules()
-
 
 @app.get("/api/fraud-rules/{rule_id}")
 async def get_fraud_rule(rule_id: str):
@@ -836,7 +778,6 @@ async def get_fraud_rule(rule_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/api/fraud-rules")
 async def create_fraud_rule(rule: dict):
     try:
@@ -848,11 +789,9 @@ async def create_fraud_rule(rule: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/api/rules")
 async def create_rule_old(rule: dict):
     return await create_fraud_rule(rule)
-
 
 @app.put("/api/fraud-rules/{rule_id}")
 async def update_fraud_rule(rule_id: str, updated_data: dict):
@@ -866,7 +805,6 @@ async def update_fraud_rule(rule_id: str, updated_data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.delete("/api/fraud-rules/{rule_id}")
 async def delete_fraud_rule(rule_id: str):
     try:
@@ -879,11 +817,9 @@ async def delete_fraud_rule(rule_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.delete("/api/rules/{rule_id}")
 async def delete_rule_old(rule_id: str):
     return await delete_fraud_rule(rule_id)
-
 
 # ----------------------------
 # Root + health
@@ -892,6 +828,10 @@ async def delete_rule_old(rule_id: str):
 async def root():
     return {"message": "FastAPI backend is running!", "timestamp": datetime.utcnow().isoformat()}
 
+# ✅ stops your Render log 404 spam for GET /api
+@app.get("/api")
+async def api_root():
+    return {"message": "API root ok", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/health")
 async def health_check():
@@ -901,11 +841,14 @@ async def health_check():
             "status": "healthy",
             "database": "connected",
             "mlModelReady": ML_MODEL_READY,
-            "mlArtifact": "models/fraud_pipeline.joblib",
+            "mlArtifact": os.path.basename(_resolve_model_path()),
+            "mlPath": _resolve_model_path(),
+            "mlError": ML_LOAD_ERROR,
+            "mlDepsAvailable": ML_DEPS_AVAILABLE,
+            "awsDepsAvailable": AWS_DEPS_AVAILABLE,
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
-
 
 @app.on_event("startup")
 async def startup_event():
@@ -915,9 +858,13 @@ async def startup_event():
     print(f"Database: {db.name}")
     try:
         db.command("ping")
-        print(" MongoDB connection successful")
+        print("MongoDB connection successful")
         collections = db.list_collection_names()
-        print(f" Collections: {collections}")
+        print(f"Collections: {collections}")
     except Exception as e:
-        print(f" MongoDB connection failed: {e}")
+        print(f"MongoDB connection failed: {e}")
+
+    # Re-attempt model load on startup (useful on Render)
+    _try_load_model()
+
     print("=" * 50)
