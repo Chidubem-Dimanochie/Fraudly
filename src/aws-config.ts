@@ -14,8 +14,8 @@ Amplify.configure({
         oauth: {
           domain: "fraudly.auth.us-east-1.amazoncognito.com",
           scopes: ["openid", "email", "profile"], 
-          redirectSignIn: [redirectSignIn],
-          redirectSignOut: [redirectSignOut],
+          redirectSignIn: ['https://fraudly-1.onrender.com/auth/callback'],
+          redirectSignOut: ['https://fraudly-1.onrender.com/login'],
           responseType: "code",
         },
       },
