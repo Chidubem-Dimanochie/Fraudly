@@ -67,6 +67,7 @@ origins = [
     "https://fraudly-git-main-chidubem-dimanochies-projects.vercel.app",
     "https://fraudly-1.onrender.com",
     "https://fraudly.onrender.com",
+    "https://unextrinsic-remona-croakingly.ngrok-free.dev"
 ]
 
 app.add_middleware(

@@ -9,7 +9,7 @@ Amplify.configure({
       loginWith: {
         oauth: {
           domain: "fraudly.auth.us-east-1.amazoncognito.com",
-          scopes: ["openid", "email", "profile"],
+          scopes: ["openid", "email", "profile","aws.cognito.signin.user.admin"],
           redirectSignIn: [`${origin}/auth/callback`],
           redirectSignOut: [`${origin}/login`],
           responseType: "code",
