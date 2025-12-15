@@ -188,7 +188,7 @@ const Login: React.FC = () => {
 
     try {
       // avoid stuck sessions
-      await signOut({ global: true }).catch(() => {});
+      await signOut().catch(() => {});
       await signInWithRedirect();
     } catch (err: any) {
       console.error("SSO login failed:", err);
