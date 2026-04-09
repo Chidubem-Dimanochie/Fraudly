@@ -63,6 +63,7 @@ const Dashboard: React.FC = () => {
         await refreshCurrentUser();
       } catch (e: any) {
         console.error('❌ Data fetch error:', e.message);
+        console.log(API_BASE);
         setError(
           'Could not load data from the server. Please ensure the backend is running '
         );

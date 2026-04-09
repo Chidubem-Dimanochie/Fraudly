@@ -829,7 +829,7 @@ async def delete_rule_old(rule_id: str):
 async def root():
     return {"message": "FastAPI backend is running!", "timestamp": datetime.utcnow().isoformat()}
 
-# ✅ stops your Render log 404 spam for GET /api
+# stops your Render log 404 spam for GET /api
 @app.get("/api")
 async def api_root():
     return {"message": "API root ok", "timestamp": datetime.utcnow().isoformat()}

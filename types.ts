@@ -8,7 +8,7 @@ export enum UserRole {
 export interface User {
   username: string;      // Cognito username (unique identifier, e.g., "johndoe" or UUID)
   email: string;         // User's email address (e.g., "john@example.com")
-  fullName?: string;     // ✅ Single full name field from Cognito's "name" attribute
+  fullName?: string;     // Single full name field from Cognito's "name" attribute
   role: UserRole;
   balance: number;
   cardFrozen: boolean;

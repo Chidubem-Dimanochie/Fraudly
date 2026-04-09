@@ -23,13 +23,13 @@ const AuthCallback: React.FC = () => {
   const startedRef = useRef(false);
   const isMountedRef = useRef(true);
 
-// ✅ Helper: redirect to login with message (survives full reloads)
+//  Helper: redirect to login with message (survives full reloads)
 const goToLoginWithError = async (message: string) => {
   try {
     await signOut({ global: true }); // stronger signout
   } catch {}
 
-  // ✅ lock login screen until user clicks the button
+  //  lock login screen until user clicks the button
   sessionStorage.setItem("AUTH_LOCKED", "1");
   sessionStorage.setItem("LOGIN_ERROR", message);
 
@@ -39,7 +39,7 @@ const goToLoginWithError = async (message: string) => {
 
 
 
-  // ✅ If AuthContext already has a user, only go to dashboard if NOT banned
+  //  If AuthContext already has a user, only go to dashboard if NOT banned
   useEffect(() => {
     if (user) {
       if (user.isBanned) {
@@ -65,14 +65,14 @@ const goToLoginWithError = async (message: string) => {
 
         await syncUserFromCognito();
 
-        // ✅ At this point, AuthContext should set user or throw.
+        //  At this point, AuthContext should set user or throw.
         // Navigation is handled by [user] effect above.
       } catch (err: any) {
         console.error("Sync error:", err);
 
         const msg = String(err?.message || "").toLowerCase();
 
-        // ✅ If banned: hard stop + message
+        //  If banned: hard stop + message
         if (msg.includes("banned") || msg.includes("suspended")) {
           setStatus("Account is banned. Redirecting...");
           await goToLoginWithError("Account is banned");

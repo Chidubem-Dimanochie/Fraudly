@@ -23,7 +23,7 @@ const AUTH_LOCKED_KEY = "AUTH_LOCKED";
 const LOGIN_PENDING_KEY = "LOGIN_PENDING";
 const LOGIN_PENDING_AT_KEY = "LOGIN_PENDING_AT";
 
-// ✅ NEW: prevents infinite banned loop, allows exactly one bounce
+//  NEW: prevents infinite banned loop, allows exactly one bounce
 const BANNED_LOOP_KEY = "BANNED_LOOP_ONCE";
 
 // how long we wait after clicking sign-in before declaring failure
@@ -64,7 +64,7 @@ const Login: React.FC = () => {
     sessionStorage.removeItem(LOGIN_PENDING_AT_KEY);
   };
 
-  // ✅ Load lock + stored error on mount
+  //  Load lock + stored error on mount
   useEffect(() => {
     const locked = sessionStorage.getItem(AUTH_LOCKED_KEY) === "1";
     const storedError = sessionStorage.getItem(LOGIN_ERROR_KEY);
@@ -73,14 +73,14 @@ const Login: React.FC = () => {
     if (storedError) setLocalError(storedError);
   }, []);
 
-  // ✅ If we reach dashboard conditions, clear error/pending and navigate
+  // If we reach dashboard conditions, clear error/pending and navigate
   useEffect(() => {
     if (!authLocked && user && !user.isBanned) {
       clearWatchdog();
       clearPending();
       clearPersistentError();
 
-      // ✅ login succeeded; reset banned loop guard
+      //  login succeeded; reset banned loop guard
       sessionStorage.removeItem(BANNED_LOOP_KEY);
 
       navigate("/dashboard", { replace: true });
@@ -88,7 +88,7 @@ const Login: React.FC = () => {
   }, [user, authLocked, navigate]);
 
   /**
-   * ✅ BANNED behavior:
+   * BANNED behavior:
    * - We WANT the old loop again, BUT ONLY ONCE.
    * - On first detection of banned user:
    *   -> lock
@@ -112,7 +112,7 @@ const Login: React.FC = () => {
 
     const alreadyLooped = sessionStorage.getItem(BANNED_LOOP_KEY) === "1";
 
-    // 🔁 allow exactly one bounce
+    // allow exactly one bounce
     if (!alreadyLooped) {
       sessionStorage.setItem(BANNED_LOOP_KEY, "1");
 
@@ -129,7 +129,7 @@ const Login: React.FC = () => {
   }, [user, navigate]);
 
   /**
-   * ✅ Watchdog logic:
+   * Watchdog logic:
    * Only show "Sign in failed" if:
    * - user clicked sign in (pending=1)
    * - still on /login after timeout
